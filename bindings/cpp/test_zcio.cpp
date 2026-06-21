@@ -85,12 +85,16 @@ int main() {
         zcio::Ring ring(64);
         std::vector<uint8_t> bits = {1, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0};
         {
-            auto s = zcio::Serial::over(ring.as_stream(), /*bit_stream=*/true);
+            // as_stream() now returns an owning Stream; keep it alive for the
+            // serial's whole lifetime (the serial borrows it).
+            auto rs = ring.as_stream();
+            auto s = zcio::Serial::over(rs, /*bit_stream=*/true);
             s.write_bits(bits, 0, bits.size());
             s.synchronize();
         }
         {
-            auto s = zcio::Serial::over(ring.as_stream(), /*bit_stream=*/true);
+            auto rs = ring.as_stream();
+            auto s = zcio::Serial::over(rs, /*bit_stream=*/true);
             std::vector<uint8_t> out;
             s.read_bits(out, 0, bits.size());
             for (size_t i = 0; i < bits.size(); ++i) CHECK(out[i] == bits[i]);
@@ -103,10 +107,26 @@ int main() {
         src.write(std::string_view("copy-me"));
         char dstbuf[16] = {};
         auto dst = zcio::memory_stream(dstbuf, sizeof dstbuf);
-        zcio::StreamRef srcref = src.as_stream();
+        auto srcref = src.as_stream();  // owning Stream; outlives the copy
         int64_t n = zcio::copy(dst, srcref, 7);
         CHECK(n == 7);
         CHECK(std::string(dstbuf, 7) == "copy-me");
+    }
+
+    // as_stream() no longer leaks: each call returns an owning Stream whose
+    // destructor frees the wrapper zcio_ring_as_stream allocates. Exercise it
+    // in a loop; with a leak this would steadily grow allocations.
+    {
+        zcio::Ring ring(64);
+        ring.write(std::string_view("loop"));
+        for (int i = 0; i < 1000; ++i) {
+            auto s = ring.as_stream();   // freed at end of each iteration
+            CHECK(static_cast<bool>(s));
+        }
+        // ring still usable after all those adapters were created and freed
+        char buf[4];
+        CHECK(ring.read(buf, 4) == 4);
+        CHECK(std::string(buf, 4) == "loop");
     }
 
     // tcp loopback (back-compat accept())

@@ -360,6 +360,7 @@ static napi_value fn_serial_set_read_pos(napi_env env, napi_callback_info info) 
     if (!b || !b->z) return zthrow(env, "serialSetReadPos: invalid serial handle");
     int64_t idx = 0;
     ZNAPI_CALL(env, napi_get_value_int64(env, argv[1], &idx));
+    if (idx < 0) return zthrow(env, "serialSetReadPos: index must be >= 0");
     zcio_serial_set_read_pos(b->z, (size_t)idx);
     napi_value undef;
     ZNAPI_CALL(env, napi_get_undefined(env, &undef));
@@ -369,6 +370,8 @@ static napi_value fn_serial_set_read_pos(napi_env env, napi_callback_info info) 
 /* -------------------------------------------------------------------------- */
 /* httpGet(url) -> { status, body, headersJson, statusText, version }         */
 /* -------------------------------------------------------------------------- */
+static napi_value http_response_to_obj(napi_env env, zcio_http_response *r);
+
 static napi_value fn_http_get(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value argv[1];
@@ -380,30 +383,7 @@ static napi_value fn_http_get(napi_env env, napi_callback_info info) {
 
     zcio_http_response r = zcio_http_get(url);
     free(url);
-
-    napi_value obj;
-    ZNAPI_CALL(env, napi_create_object(env, &obj));
-
-    napi_value v_status, v_body, v_headers, v_statustext, v_version, v_proto;
-    ZNAPI_CALL(env, napi_create_int32(env, r.status, &v_status));
-    ZNAPI_CALL(env, napi_create_string_utf8(env, r.body ? r.body : "",
-                                            r.body ? r.body_size : 0, &v_body));
-    ZNAPI_CALL(env, napi_create_string_utf8(env, r.headers_json ? r.headers_json : "{}",
-                                            NAPI_AUTO_LENGTH, &v_headers));
-    ZNAPI_CALL(env, napi_create_string_utf8(env, r.status_text ? r.status_text : "",
-                                            NAPI_AUTO_LENGTH, &v_statustext));
-    ZNAPI_CALL(env, napi_create_string_utf8(env, r.version ? r.version : "",
-                                            NAPI_AUTO_LENGTH, &v_version));
-    ZNAPI_CALL(env, napi_create_string_utf8(env, r.protocol ? r.protocol : "",
-                                            NAPI_AUTO_LENGTH, &v_proto));
-
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "status", v_status));
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "body", v_body));
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "headersJson", v_headers));
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "statusText", v_statustext));
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "version", v_version));
-    ZNAPI_CALL(env, napi_set_named_property(env, obj, "protocol", v_proto));
-
+    napi_value obj = http_response_to_obj(env, &r);
     zcio_http_response_free(&r);
     return obj;
 }
@@ -418,17 +398,20 @@ static napi_value fn_http_get(napi_env env, napi_callback_info info) {
 /* ========================================================================== */
 typedef struct {
     zcio_stream *s;
-    bool         owns;   /* call zcio_stream_free on finalize */
-    void        *buf;    /* optional backing memory to free   */
+    bool         owns;     /* call zcio_stream_free on finalize */
+    void        *buf;      /* optional backing memory to free   */
+    napi_ref     parent;   /* optional strong ref to a borrowed-from external
+                            * (e.g. the ring backing a ring_as_stream), released
+                            * on finalize so the parent outlives this stream    */
 } stream_box;
 
 static void stream_finalize(napi_env env, void *data, void *hint) {
-    (void)env;
     (void)hint;
     stream_box *b = (stream_box *)data;
     if (!b) return;
     if (b->owns && b->s) zcio_stream_free(b->s);
     if (b->buf) free(b->buf);
+    if (b->parent) napi_delete_reference(env, b->parent);
     free(b);
 }
 
@@ -441,12 +424,20 @@ static stream_box *unwrap_stream(napi_env env, napi_value v) {
 /* Wrap an existing zcio_stream into a fresh external. owns=false for borrowed. */
 static napi_value make_stream_ext(napi_env env, zcio_stream *s, bool owns, void *buf) {
     stream_box *box = (stream_box *)calloc(1, sizeof(*box));
-    if (!box) return zthrow(env, "out of memory");
+    if (!box) {
+        /* Took ownership of these on entry; release on this error path. */
+        if (owns && s) zcio_stream_free(s);
+        if (buf) free(buf);
+        return zthrow(env, "out of memory");
+    }
     box->s = s;
     box->owns = owns;
     box->buf = buf;
+    box->parent = NULL;
     napi_value ext;
     if (napi_create_external(env, box, stream_finalize, NULL, &ext) != napi_ok) {
+        if (owns && s) zcio_stream_free(s);
+        if (buf) free(buf);
         free(box);
         return zthrow(env, "failed to create stream handle");
     }
@@ -543,6 +534,82 @@ static napi_value fn_stream_copy(napi_env env, napi_callback_info info) {
     return out;
 }
 
+/* streamSeek(handle, off, origin, which) -> int64 new offset (neg = error) */
+static napi_value fn_stream_seek(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "streamSeek(handle, off[, origin, which]) requires 2 arguments");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamSeek: invalid stream handle");
+    int64_t off = 0;
+    ZNAPI_CALL(env, napi_get_value_int64(env, argv[1], &off));
+    int32_t origin = ZCIO_SEEK_SET, which = ZCIO_SEEK_BOTH;
+    if (argc >= 3) { napi_valuetype t; ZNAPI_CALL(env, napi_typeof(env, argv[2], &t));
+        if (t == napi_number) ZNAPI_CALL(env, napi_get_value_int32(env, argv[2], &origin)); }
+    if (argc >= 4) { napi_valuetype t; ZNAPI_CALL(env, napi_typeof(env, argv[3], &t));
+        if (t == napi_number) ZNAPI_CALL(env, napi_get_value_int32(env, argv[3], &which)); }
+    int64_t n = zcio_seek(b->s, off, (zcio_seek_origin)origin, (zcio_seek_which)which);
+    napi_value out; ZNAPI_CALL(env, napi_create_int64(env, n, &out));
+    return out;
+}
+
+/* streamFlush(handle) -> int */
+static napi_value fn_stream_flush(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "streamFlush(handle) requires a handle");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamFlush: invalid stream handle");
+    napi_value out; ZNAPI_CALL(env, napi_create_int32(env, zcio_flush(b->s), &out));
+    return out;
+}
+
+/* streamClose(handle) -> int (half/full close the endpoint) */
+static napi_value fn_stream_close(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "streamClose(handle) requires a handle");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamClose: invalid stream handle");
+    napi_value out; ZNAPI_CALL(env, napi_create_int32(env, zcio_close(b->s), &out));
+    return out;
+}
+
+/* streamAvailable(handle) -> int64 */
+static napi_value fn_stream_available(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "streamAvailable(handle) requires a handle");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamAvailable: invalid stream handle");
+    napi_value out; ZNAPI_CALL(env, napi_create_int64(env, zcio_available(b->s), &out));
+    return out;
+}
+
+/* streamEof(handle) -> bool */
+static napi_value fn_stream_eof(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "streamEof(handle) requires a handle");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamEof: invalid stream handle");
+    napi_value out; ZNAPI_CALL(env, napi_get_boolean(env, zcio_stream_eof(b->s), &out));
+    return out;
+}
+
+/* streamName(handle) -> string */
+static napi_value fn_stream_name(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "streamName(handle) requires a handle");
+    stream_box *b = unwrap_stream(env, argv[0]);
+    if (!b || !b->s) return zthrow(env, "streamName: invalid stream handle");
+    const char *nm = zcio_stream_name(b->s);
+    napi_value out;
+    ZNAPI_CALL(env, napi_create_string_utf8(env, nm ? nm : "", NAPI_AUTO_LENGTH, &out));
+    return out;
+}
+
 /* ringAsStream(ringHandle) -> stream handle (borrows the ring) */
 static napi_value fn_ring_as_stream(napi_env env, napi_callback_info info) {
     size_t argc = 1;
@@ -556,7 +623,28 @@ static napi_value fn_ring_as_stream(napi_env env, napi_callback_info info) {
      * wrapper, but not the borrowed ring. */
     zcio_stream *s = zcio_ring_as_stream(r, false);
     if (!s) return zthrow(env, "ringAsStream: zcio_ring_as_stream failed");
-    return make_stream_ext(env, s, true, NULL);
+    napi_value ext = make_stream_ext(env, s, true, NULL);
+    if (!ext) return NULL;
+    /* The stream borrows the ring's native pointer. Hold a strong ref to the
+     * ring external so the Ring cannot be GC'd (and freed) before this stream,
+     * which would leave the stream dangling (UAF). The ref is released in the
+     * stream's finalizer. */
+    stream_box *b = unwrap_stream(env, ext);
+    if (b && napi_create_reference(env, argv[0], 1, &b->parent) != napi_ok)
+        return zthrow(env, "ringAsStream: failed to ref ring handle");
+    return ext;
+}
+
+/* The returned Buffer aliases the SAME native memory that the stream box owns
+ * and frees on finalize. To prevent a use-after-free / double-free if the stream
+ * handle is GC'd before the Buffer, the Buffer holds a strong napi_ref to the
+ * stream external. The stream box is the single owner of `mem` (its finalizer
+ * frees it); the Buffer's finalizer does NOT free `mem` -- it only releases the
+ * ref, allowing the stream (and then `mem`) to be reclaimed afterwards. */
+static void mem_buffer_finalize(napi_env env, void *data, void *hint) {
+    (void)data;
+    napi_ref ref = (napi_ref)hint;
+    if (ref) napi_delete_reference(env, ref);
 }
 
 /* memoryStream(size) -> { handle, buffer } over a fresh backing buffer */
@@ -572,11 +660,25 @@ static napi_value fn_memory_stream(napi_env env, napi_callback_info info) {
     if (!mem) return zthrow(env, "memoryStream: out of memory");
     zcio_stream *s = zcio_memory_stream(mem, (size_t)size);
     if (!s) { free(mem); return zthrow(env, "memoryStream: zcio_memory_stream failed"); }
+    /* The stream box owns `mem` and frees both on finalize. On failure,
+     * make_stream_ext has already released `s` and `mem`. */
     napi_value handle = make_stream_ext(env, s, true, mem);
-    if (!handle) { return NULL; } /* box took ownership only on success; on error mem leaked once */
-    /* Expose the backing memory as an external ArrayBuffer view so JS can read it. */
+    if (!handle) return NULL;
+
+    /* Strong ref to the stream handle, owned by the Buffer's finalizer. This
+     * pins the stream box (the sole owner of `mem`) for at least as long as the
+     * Buffer is alive, so the Buffer never aliases freed memory. */
+    napi_ref handle_ref = NULL;
+    if (napi_create_reference(env, handle, 1, &handle_ref) != napi_ok)
+        return zthrow(env, "memoryStream: failed to ref stream handle");
+
+    /* Buffer over the same `mem`; its finalizer frees nothing but the ref. */
     napi_value buffer;
-    ZNAPI_CALL(env, napi_create_external_buffer(env, (size_t)size, mem, NULL, NULL, &buffer));
+    if (napi_create_external_buffer(env, (size_t)size, mem,
+                                    mem_buffer_finalize, handle_ref, &buffer) != napi_ok) {
+        napi_delete_reference(env, handle_ref);
+        return zthrow(env, "memoryStream: failed to create buffer view");
+    }
     napi_value obj;
     ZNAPI_CALL(env, napi_create_object(env, &obj));
     ZNAPI_CALL(env, napi_set_named_property(env, obj, "handle", handle));
@@ -885,6 +987,127 @@ static napi_value fn_mcast_receiver_stream(napi_env env, napi_callback_info info
 }
 
 /* ========================================================================== */
+/* TLS                                                                        */
+/*                                                                            */
+/* A zcio_tls_ctx is a per-role config. The net layer BORROWS it, so the      */
+/* caller owns it; here the external's finalizer frees it on GC. The JS side  */
+/* must keep the ctx reachable while any connection using it is alive.        */
+/* ========================================================================== */
+static void tls_ctx_finalize(napi_env env, void *data, void *hint) {
+    (void)env; (void)hint;
+    if (data) zcio_tls_ctx_free((zcio_tls_ctx *)data);
+}
+
+/* tlsAvailable() -> bool */
+static napi_value fn_tls_available(napi_env env, napi_callback_info info) {
+    (void)info;
+    napi_value out;
+    ZNAPI_CALL(env, napi_get_boolean(env, zcio_tls_available(), &out));
+    return out;
+}
+
+/* tlsBackendName() -> string */
+static napi_value fn_tls_backend_name(napi_env env, napi_callback_info info) {
+    (void)info;
+    const char *n = zcio_tls_backend_name();
+    napi_value out;
+    ZNAPI_CALL(env, napi_create_string_utf8(env, n ? n : "", NAPI_AUTO_LENGTH, &out));
+    return out;
+}
+
+/* tlsClientCtx(host) -> ctx handle | null */
+static napi_value fn_tls_client_ctx(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "tlsClientCtx(host) requires a host");
+    char *host = get_string_arg(env, argv[0]);
+    if (!host) return zthrow(env, "tlsClientCtx: host must be a string");
+    zcio_tls_ctx *ctx = zcio_tls_client_ctx(host);
+    free(host);
+    if (!ctx) { napi_value n; ZNAPI_CALL(env, napi_get_null(env, &n)); return n; }
+    napi_value ext;
+    ZNAPI_CALL(env, napi_create_external(env, ctx, tls_ctx_finalize, NULL, &ext));
+    return ext;
+}
+
+/* tlsServerCtx() -> ctx handle | null (generated self-signed cert) */
+static napi_value fn_tls_server_ctx(napi_env env, napi_callback_info info) {
+    (void)info;
+    zcio_tls_ctx *ctx = zcio_tls_server_ctx();
+    if (!ctx) { napi_value n; ZNAPI_CALL(env, napi_get_null(env, &n)); return n; }
+    napi_value ext;
+    ZNAPI_CALL(env, napi_create_external(env, ctx, tls_ctx_finalize, NULL, &ext));
+    return ext;
+}
+
+/* tlsServerCtxFiles(certPath, keyPath) -> ctx handle | null */
+static napi_value fn_tls_server_ctx_files(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "tlsServerCtxFiles(cert, key) requires 2 arguments");
+    char *cert = get_string_arg(env, argv[0]);
+    if (!cert) return zthrow(env, "tlsServerCtxFiles: cert must be a string");
+    char *key = get_string_arg(env, argv[1]);
+    if (!key) { free(cert); return zthrow(env, "tlsServerCtxFiles: key must be a string"); }
+    zcio_tls_ctx *ctx = zcio_tls_server_ctx_files(cert, key);
+    free(cert); free(key);
+    if (!ctx) { napi_value n; ZNAPI_CALL(env, napi_get_null(env, &n)); return n; }
+    napi_value ext;
+    ZNAPI_CALL(env, napi_create_external(env, ctx, tls_ctx_finalize, NULL, &ext));
+    return ext;
+}
+
+/* tlsCtxFree(ctx) -> undefined (advisory; finalizer owns the lifetime) */
+static napi_value fn_tls_ctx_free(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
+    return undef;
+}
+
+/* tcpClientConnectTls(host, port, ctx, verify) -> client handle | null */
+static napi_value fn_tcp_client_connect_tls(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 3) return zthrow(env, "tcpClientConnectTls(host, port, ctx[, verify]) requires 3 arguments");
+    char *host = get_string_arg(env, argv[0]);
+    if (!host) return zthrow(env, "tcpClientConnectTls: host must be a string");
+    int32_t port = 0;
+    if (napi_get_value_int32(env, argv[1], &port) != napi_ok) { free(host); return zthrow(env, "tcpClientConnectTls: port must be a number"); }
+    void *ctx = NULL;
+    if (napi_get_value_external(env, argv[2], &ctx) != napi_ok || !ctx) { free(host); return zthrow(env, "tcpClientConnectTls: invalid ctx handle"); }
+    bool verify = true;
+    if (argc >= 4) { napi_valuetype t; ZNAPI_CALL(env, napi_typeof(env, argv[3], &t));
+        if (t == napi_boolean) ZNAPI_CALL(env, napi_get_value_bool(env, argv[3], &verify)); }
+    zcio_tcp_client *c = zcio_tcp_client_connect_tls(host, port, (zcio_tls_ctx *)ctx, verify);
+    free(host);
+    if (!c) { napi_value n; ZNAPI_CALL(env, napi_get_null(env, &n)); return n; }
+    napi_value ext;
+    ZNAPI_CALL(env, napi_create_external(env, c, tcp_client_finalize, NULL, &ext));
+    return ext;
+}
+
+/* tcpServerListenTls(port, ctx, nonBlocking) -> server handle | null */
+static napi_value fn_tcp_server_listen_tls(napi_env env, napi_callback_info info) {
+    size_t argc = 3; napi_value argv[3];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "tcpServerListenTls(port, ctx[, nonBlocking]) requires 2 arguments");
+    int32_t port = 0;
+    ZNAPI_CALL(env, napi_get_value_int32(env, argv[0], &port));
+    void *ctx = NULL;
+    if (napi_get_value_external(env, argv[1], &ctx) != napi_ok || !ctx)
+        return zthrow(env, "tcpServerListenTls: invalid ctx handle");
+    bool non_blocking = false;
+    if (argc >= 3) { napi_valuetype t; ZNAPI_CALL(env, napi_typeof(env, argv[2], &t));
+        if (t == napi_boolean) ZNAPI_CALL(env, napi_get_value_bool(env, argv[2], &non_blocking)); }
+    zcio_tcp_server *s = zcio_tcp_server_listen_tls(port, (zcio_tls_ctx *)ctx, non_blocking);
+    if (!s) { napi_value n; ZNAPI_CALL(env, napi_get_null(env, &n)); return n; }
+    napi_value ext;
+    ZNAPI_CALL(env, napi_create_external(env, s, tcp_server_finalize, NULL, &ext));
+    return ext;
+}
+
+/* ========================================================================== */
 /* DNS                                                                        */
 /* ========================================================================== */
 /* resolveIpv4(host) -> string | null */
@@ -905,29 +1128,45 @@ static napi_value fn_resolve_ipv4(napi_env env, napi_callback_info info) {
     return out;
 }
 
-/* dnsQueryA(host) -> string[] */
-static napi_value fn_dns_query_a(napi_env env, napi_callback_info info) {
+/* shared helper: run a zcio_dns_query_* and marshal the strv into a JS array */
+static napi_value dns_query_to_array(napi_env env, napi_callback_info info,
+                                     char **(*query)(const char *, size_t *),
+                                     const char *who) {
     size_t argc = 1;
     napi_value argv[1];
     ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
-    if (argc < 1) return zthrow(env, "dnsQueryA(host) requires a host");
+    if (argc < 1) return zthrow(env, who);
     char *host = get_string_arg(env, argv[0]);
-    if (!host) return zthrow(env, "dnsQueryA: host must be a string");
+    if (!host) return zthrow(env, "dnsQuery: host must be a string");
     size_t count = 0;
-    char **v = zcio_dns_query_a(host, &count);
+    char **v = query(host, &count);
     free(host);
+    /* Guard against a NULL array with a nonzero count (defensive). */
+    if (!v) count = 0;
     napi_value arr;
     ZNAPI_CALL(env, napi_create_array_with_length(env, count, &arr));
     for (size_t i = 0; i < count; i++) {
         napi_value s;
         if (napi_create_string_utf8(env, v[i] ? v[i] : "", NAPI_AUTO_LENGTH, &s) != napi_ok) {
-            if (v) zcio_strv_free(v, count);
-            return zthrow(env, "dnsQueryA: failed to create string");
+            zcio_strv_free(v, count);
+            return zthrow(env, "dnsQuery: failed to create string");
         }
         ZNAPI_CALL(env, napi_set_element(env, arr, (uint32_t)i, s));
     }
     if (v) zcio_strv_free(v, count);
     return arr;
+}
+
+/* dnsQueryA(host) -> string[] */
+static napi_value fn_dns_query_a(napi_env env, napi_callback_info info) {
+    return dns_query_to_array(env, info, zcio_dns_query_a,
+                              "dnsQueryA(host) requires a host");
+}
+
+/* dnsQueryAaaa(host) -> string[] (IPv6 / AAAA records) */
+static napi_value fn_dns_query_aaaa(napi_env env, napi_callback_info info) {
+    return dns_query_to_array(env, info, zcio_dns_query_aaaa,
+                              "dnsQueryAaaa(host) requires a host");
 }
 
 /* localIpv4() -> string | null */
@@ -968,6 +1207,7 @@ static napi_value fn_serial_set_write_pos(napi_env env, napi_callback_info info)
     if (!b || !b->z) return zthrow(env, "serialSetWritePos: invalid serial handle");
     int64_t idx = 0;
     ZNAPI_CALL(env, napi_get_value_int64(env, argv[1], &idx));
+    if (idx < 0) return zthrow(env, "serialSetWritePos: index must be >= 0");
     zcio_serial_set_write_pos(b->z, (size_t)idx);
     napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
     return undef;
@@ -1032,6 +1272,7 @@ static napi_value fn_serial_write_i64(napi_env env, napi_callback_info info) {
     if (!b || !b->z) return zthrow(env, "serialWriteI64: invalid serial handle");
     int64_t v = 0; bool lossless = false;
     ZNAPI_CALL(env, napi_get_value_bigint_int64(env, argv[1], &v, &lossless));
+    if (!lossless) return zthrow(env, "serialWriteI64: value out of int64 range");
     zcio_serial_write_i64(b->z, v);
     napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
     return undef;
@@ -1054,6 +1295,7 @@ static napi_value fn_serial_write_u64(napi_env env, napi_callback_info info) {
     if (!b || !b->z) return zthrow(env, "serialWriteU64: invalid serial handle");
     uint64_t v = 0; bool lossless = false;
     ZNAPI_CALL(env, napi_get_value_bigint_uint64(env, argv[1], &v, &lossless));
+    if (!lossless) return zthrow(env, "serialWriteU64: value out of uint64 range");
     zcio_serial_write_u64(b->z, v);
     napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
     return undef;
@@ -1177,6 +1419,76 @@ static napi_value fn_serial_read_bytes(napi_env env, napi_callback_info info) {
     return out;
 }
 
+/* serialSynchronize(handle): flush any partial write-bit byte + sync stream */
+static napi_value fn_serial_synchronize(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "serialSynchronize(handle) requires a handle");
+    serial_box *b = unwrap_serial(env, argv[0]);
+    if (!b || !b->z) return zthrow(env, "serialSynchronize: invalid serial handle");
+    zcio_serial_synchronize(b->z);
+    napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
+    return undef;
+}
+
+/* serialWriteBits(handle, boolArray) -- one bit per element, written in order. */
+static napi_value fn_serial_write_bits(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "serialWriteBits(handle, bits[]) requires 2 arguments");
+    serial_box *b = unwrap_serial(env, argv[0]);
+    if (!b || !b->z) return zthrow(env, "serialWriteBits: invalid serial handle");
+    bool is_arr = false;
+    ZNAPI_CALL(env, napi_is_array(env, argv[1], &is_arr));
+    if (!is_arr) return zthrow(env, "serialWriteBits: second argument must be an array");
+    uint32_t count = 0;
+    ZNAPI_CALL(env, napi_get_array_length(env, argv[1], &count));
+    uint8_t *bits = (uint8_t *)malloc(count ? count : 1);
+    if (!bits) return zthrow(env, "serialWriteBits: out of memory");
+    for (uint32_t i = 0; i < count; i++) {
+        napi_value el; bool truthy = false;
+        if (napi_get_element(env, argv[1], i, &el) != napi_ok ||
+            napi_get_value_bool(env, el, &truthy) != napi_ok) {
+            /* fall back to coercion for non-boolean elements (e.g. 0/1) */
+            napi_coerce_to_bool(env, el, &el);
+            napi_get_value_bool(env, el, &truthy);
+        }
+        bits[i] = truthy ? 1 : 0;
+    }
+    zcio_serial_write_bits(b->z, bits, 0, count);
+    free(bits);
+    napi_value undef; ZNAPI_CALL(env, napi_get_undefined(env, &undef));
+    return undef;
+}
+
+/* serialReadBits(handle, count) -> bool[] */
+static napi_value fn_serial_read_bits(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "serialReadBits(handle, count) requires 2 arguments");
+    serial_box *b = unwrap_serial(env, argv[0]);
+    if (!b || !b->z) return zthrow(env, "serialReadBits: invalid serial handle");
+    int64_t count = 0;
+    ZNAPI_CALL(env, napi_get_value_int64(env, argv[1], &count));
+    if (count < 0) return zthrow(env, "serialReadBits: count must be >= 0");
+    uint8_t *bits = (uint8_t *)calloc((size_t)count ? (size_t)count : 1, 1);
+    if (!bits) return zthrow(env, "serialReadBits: out of memory");
+    zcio_serial_read_bits(b->z, bits, 0, (size_t)count);
+    napi_value arr;
+    if (napi_create_array_with_length(env, (size_t)count, &arr) != napi_ok) {
+        free(bits); return zthrow(env, "serialReadBits: failed to create array");
+    }
+    for (int64_t i = 0; i < count; i++) {
+        napi_value v;
+        if (napi_get_boolean(env, bits[i] != 0, &v) != napi_ok ||
+            napi_set_element(env, arr, (uint32_t)i, v) != napi_ok) {
+            free(bits); return zthrow(env, "serialReadBits: failed to set element");
+        }
+    }
+    free(bits);
+    return arr;
+}
+
 /* ========================================================================== */
 /* HTTP POST                                                                  */
 /* ========================================================================== */
@@ -1202,13 +1514,110 @@ static napi_value fn_http_post(napi_env env, napi_callback_info info) {
     return obj;
 }
 
+/* httpDelete(url) -> response object */
+static napi_value fn_http_delete(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value argv[1];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "httpDelete(url) requires a url");
+    char *url = get_string_arg(env, argv[0]);
+    if (!url) return zthrow(env, "httpDelete: expected a string url");
+    zcio_http_response r = zcio_http_delete(url);
+    free(url);
+    napi_value obj = http_response_to_obj(env, &r);
+    zcio_http_response_free(&r);
+    return obj;
+}
+
+/* httpPut(url, body) -> response object */
+static napi_value fn_http_put(napi_env env, napi_callback_info info) {
+    size_t argc = 2; napi_value argv[2];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 1) return zthrow(env, "httpPut(url, body) requires a url");
+    char *url = get_string_arg(env, argv[0]);
+    if (!url) return zthrow(env, "httpPut: expected a string url");
+    void *data = NULL; size_t len = 0;
+    if (argc >= 2) {
+        bool is_buf = false;
+        if (napi_is_buffer(env, argv[1], &is_buf) == napi_ok && is_buf)
+            napi_get_buffer_info(env, argv[1], &data, &len);
+    }
+    zcio_http_response r = zcio_http_put(url, data, len);
+    free(url);
+    napi_value obj = http_response_to_obj(env, &r);
+    zcio_http_response_free(&r);
+    return obj;
+}
+
+/* httpRequest(method, url, headers[, body]) -> response object
+ * headers is an array of [key, value] string pairs. */
+static napi_value fn_http_request(napi_env env, napi_callback_info info) {
+    size_t argc = 4; napi_value argv[4];
+    ZNAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+    if (argc < 2) return zthrow(env, "httpRequest(method, url[, headers, body]) requires 2 arguments");
+    char *method = get_string_arg(env, argv[0]);
+    if (!method) return zthrow(env, "httpRequest: method must be a string");
+    char *url = get_string_arg(env, argv[1]);
+    if (!url) { free(method); return zthrow(env, "httpRequest: url must be a string"); }
+
+    /* parse optional headers array of [key, value] pairs */
+    zcio_http_header *headers = NULL;
+    char **hstrs = NULL;   /* 2 malloc'd strings per header, freed after the call */
+    size_t hcount = 0;
+    if (argc >= 3) {
+        bool is_arr = false;
+        if (napi_is_array(env, argv[2], &is_arr) == napi_ok && is_arr) {
+            uint32_t n = 0;
+            if (napi_get_array_length(env, argv[2], &n) == napi_ok && n > 0) {
+                headers = (zcio_http_header *)calloc(n, sizeof(*headers));
+                hstrs = (char **)calloc((size_t)n * 2, sizeof(char *));
+                if (!headers || !hstrs) {
+                    free(headers); free(hstrs); free(method); free(url);
+                    return zthrow(env, "httpRequest: out of memory");
+                }
+                for (uint32_t i = 0; i < n; i++) {
+                    napi_value pair, k, v;
+                    if (napi_get_element(env, argv[2], i, &pair) != napi_ok) continue;
+                    if (napi_get_element(env, pair, 0, &k) != napi_ok) continue;
+                    if (napi_get_element(env, pair, 1, &v) != napi_ok) continue;
+                    char *ks = get_string_arg(env, k);
+                    char *vs = get_string_arg(env, v);
+                    hstrs[i * 2] = ks; hstrs[i * 2 + 1] = vs;
+                    headers[hcount].key = ks ? ks : "";
+                    headers[hcount].value = vs ? vs : "";
+                    hcount++;
+                }
+            }
+        }
+    }
+
+    /* optional body */
+    void *data = NULL; size_t len = 0;
+    if (argc >= 4) {
+        bool is_buf = false;
+        if (napi_is_buffer(env, argv[3], &is_buf) == napi_ok && is_buf)
+            napi_get_buffer_info(env, argv[3], &data, &len);
+    }
+
+    zcio_http_response r = zcio_http_request(method, url, headers, hcount, data, len);
+    free(method); free(url);
+    if (hstrs) { for (size_t i = 0; i < hcount * 2; i++) free(hstrs[i]); free(hstrs); }
+    free(headers);
+    napi_value obj = http_response_to_obj(env, &r);
+    zcio_http_response_free(&r);
+    return obj;
+}
+
 /* shared response -> JS object builder (also used by httpGet) */
 static napi_value http_response_to_obj(napi_env env, zcio_http_response *r) {
     napi_value obj;
     if (napi_create_object(env, &obj) != napi_ok) return NULL;
     napi_value v_status, v_body, v_headers, v_statustext, v_version, v_proto;
     if (napi_create_int32(env, r->status, &v_status) != napi_ok) return NULL;
-    if (napi_create_string_utf8(env, r->body ? r->body : "", r->body ? r->body_size : 0, &v_body) != napi_ok) return NULL;
+    /* body is returned as a Buffer (copy of body_size bytes) so binary /
+     * compressed payloads survive intact; UTF-8 string-ifying would corrupt
+     * them. JS callers can do body.toString() for text. */
+    if (napi_create_buffer_copy(env, r->body ? r->body_size : 0,
+                                r->body ? r->body : "", NULL, &v_body) != napi_ok) return NULL;
     if (napi_create_string_utf8(env, r->headers_json ? r->headers_json : "{}", NAPI_AUTO_LENGTH, &v_headers) != napi_ok) return NULL;
     if (napi_create_string_utf8(env, r->status_text ? r->status_text : "", NAPI_AUTO_LENGTH, &v_statustext) != napi_ok) return NULL;
     if (napi_create_string_utf8(env, r->version ? r->version : "", NAPI_AUTO_LENGTH, &v_version) != napi_ok) return NULL;
@@ -1283,12 +1692,21 @@ static napi_value Init(napi_env env, napi_value exports) {
     DECL("serialReadBit", fn_serial_read_bit);
     DECL("serialWriteBytes", fn_serial_write_bytes);
     DECL("serialReadBytes", fn_serial_read_bytes);
+    DECL("serialSynchronize", fn_serial_synchronize);
+    DECL("serialWriteBits", fn_serial_write_bits);
+    DECL("serialReadBits", fn_serial_read_bits);
 
     /* generic stream verbs */
     DECL("streamWrite", fn_stream_write);
     DECL("streamRead", fn_stream_read);
     DECL("streamReadFull", fn_stream_read_full);
     DECL("streamCopy", fn_stream_copy);
+    DECL("streamSeek", fn_stream_seek);
+    DECL("streamFlush", fn_stream_flush);
+    DECL("streamClose", fn_stream_close);
+    DECL("streamAvailable", fn_stream_available);
+    DECL("streamEof", fn_stream_eof);
+    DECL("streamName", fn_stream_name);
     DECL("ringAsStream", fn_ring_as_stream);
     DECL("memoryStream", fn_memory_stream);
 
@@ -1301,6 +1719,16 @@ static napi_value Init(napi_env env, napi_value exports) {
     DECL("tcpConnStream", fn_tcp_conn_stream);
     DECL("tcpServerCloseClient", fn_tcp_server_close_client);
     DECL("tcpServerFree", fn_advisory_free);
+    DECL("tcpClientConnectTls", fn_tcp_client_connect_tls);
+    DECL("tcpServerListenTls", fn_tcp_server_listen_tls);
+
+    /* TLS */
+    DECL("tlsAvailable", fn_tls_available);
+    DECL("tlsBackendName", fn_tls_backend_name);
+    DECL("tlsClientCtx", fn_tls_client_ctx);
+    DECL("tlsServerCtx", fn_tls_server_ctx);
+    DECL("tlsServerCtxFiles", fn_tls_server_ctx_files);
+    DECL("tlsCtxFree", fn_tls_ctx_free);
 
     /* UDP */
     DECL("udpClientOpen", fn_udp_client_open);
@@ -1322,10 +1750,14 @@ static napi_value Init(napi_env env, napi_value exports) {
     /* DNS */
     DECL("resolveIpv4", fn_resolve_ipv4);
     DECL("dnsQueryA", fn_dns_query_a);
+    DECL("dnsQueryAaaa", fn_dns_query_aaaa);
     DECL("localIpv4", fn_local_ipv4);
 
     DECL("httpGet", fn_http_get);
     DECL("httpPost", fn_http_post);
+    DECL("httpDelete", fn_http_delete);
+    DECL("httpPut", fn_http_put);
+    DECL("httpRequest", fn_http_request);
 
 #undef DECL
     return exports;

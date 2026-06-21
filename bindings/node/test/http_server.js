@@ -15,12 +15,16 @@ function send(res, text) {
 }
 
 const srv = http.createServer((req, res) => {
-  if (req.method === 'POST') {
+  if (req.method === 'POST' || req.method === 'PUT') {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
-    req.on('end', () => send(res, 'posted:' + Buffer.concat(chunks).toString()));
+    const verb = req.method.toLowerCase() === 'put' ? 'put' : 'posted';
+    req.on('end', () => send(res, verb + ':' + Buffer.concat(chunks).toString()));
     return;
   }
+  if (req.method === 'DELETE') { send(res, 'deleted'); return; }
+  // Echo a custom request header back so httpRequest header passing can be tested.
+  if (req.headers['x-echo']) { send(res, 'echo:' + req.headers['x-echo']); return; }
   send(res, BODY);
 });
 

@@ -92,7 +92,41 @@ class Stream {
   copyFrom(src, limit) {
     return native.streamCopy(this._handle, src._handle, limit);
   }
+
+  /**
+   * Reposition the read/write cursor(s).
+   * @param {number} off
+   * @param {number} [origin=Stream.SEEK_SET]
+   * @param {number} [which=Stream.SEEK_BOTH]
+   * @returns {number} new absolute offset (negative on error)
+   */
+  seek(off, origin = Stream.SEEK_SET, which = Stream.SEEK_BOTH) {
+    return native.streamSeek(this._handle, off, origin, which);
+  }
+
+  /** @returns {number} 0 on success */
+  flush() { return native.streamFlush(this._handle); }
+
+  /** Half/full close the endpoint. @returns {number} 0 on success */
+  close() { return native.streamClose(this._handle); }
+
+  /** @returns {number} bytes readable without blocking */
+  available() { return native.streamAvailable(this._handle); }
+
+  /** @returns {boolean} true once no more data will come */
+  eof() { return native.streamEof(this._handle); }
+
+  /** @returns {string} backend identifier, e.g. "ring", "tcp", "memory" */
+  name() { return native.streamName(this._handle); }
 }
+
+/* seek origin / which constants (mirror zcio/types.h) */
+Stream.SEEK_SET = 0;
+Stream.SEEK_CUR = 1;
+Stream.SEEK_END = 2;
+Stream.SEEK_READ = 1;
+Stream.SEEK_WRITE = 2;
+Stream.SEEK_BOTH = 3;
 
 /**
  * A memory-backed stream over a fresh buffer. `buffer` is a Node Buffer view of
@@ -157,6 +191,19 @@ class SerialBase {
   readPos() { return native.serialReadPos(this._handle); }
   writeLen() { return native.serialWriteLen(this._handle); }
   readLen() { return native.serialReadLen(this._handle); }
+  /** Flush any partial write-bit byte and sync the underlying stream. */
+  synchronize() { return native.serialSynchronize(this._handle); }
+  /**
+   * Pack a sequence of bits (one boolean per element) in order.
+   * @param {Array<boolean|number>} bits
+   */
+  writeBits(bits) { return native.serialWriteBits(this._handle, bits.map((b) => !!b)); }
+  /**
+   * Read `count` bits back as an array of booleans.
+   * @param {number} count
+   * @returns {boolean[]}
+   */
+  readBits(count) { return native.serialReadBits(this._handle, count); }
 }
 
 /** Buffer-mode serializer over a fresh fixed-size backing buffer. */
@@ -186,6 +233,44 @@ class CountSerial extends SerialBase {
 /* TCP                                                                        */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * TLS context (per-role config). Borrowed by the connections it is passed to;
+ * keep the TlsCtx reachable for as long as those connections live.
+ */
+class TlsCtx {
+  /** @param {*} handle native external ctx handle */
+  constructor(handle) { this._handle = handle; }
+
+  /**
+   * Client context that verifies `host` (SNI + cert hostname).
+   * @param {string} host @returns {TlsCtx|null}
+   */
+  static client(host) {
+    const h = native.tlsClientCtx(host);
+    return h ? new TlsCtx(h) : null;
+  }
+
+  /** Server context with a generated self-signed cert. @returns {TlsCtx|null} */
+  static server() {
+    const h = native.tlsServerCtx();
+    return h ? new TlsCtx(h) : null;
+  }
+
+  /**
+   * Server context from PEM cert/key file paths.
+   * @param {string} certPath @param {string} keyPath @returns {TlsCtx|null}
+   */
+  static serverFiles(certPath, keyPath) {
+    const h = native.tlsServerCtxFiles(certPath, keyPath);
+    return h ? new TlsCtx(h) : null;
+  }
+
+  /** Advisory; native ctx freed on GC. */
+  free() {
+    if (this._handle) { native.tlsCtxFree(this._handle); this._handle = null; }
+  }
+}
+
 /** TCP client connection. Returns null from connect() failure via factory. */
 class TcpClient {
   /**
@@ -198,6 +283,21 @@ class TcpClient {
     if (!h) return null;
     const c = Object.create(TcpClient.prototype);
     c._handle = h;
+    return c;
+  }
+
+  /**
+   * Connect with TLS using a TlsCtx (borrowed; kept alive by the returned
+   * client so the ctx outlives the connection).
+   * @param {string} host @param {number} port @param {TlsCtx} ctx
+   * @param {boolean} [verify=true] @returns {TcpClient|null}
+   */
+  static connectTls(host, port, ctx, verify = true) {
+    const h = native.tcpClientConnectTls(host, port, ctx._handle, verify);
+    if (!h) return null;
+    const c = Object.create(TcpClient.prototype);
+    c._handle = h;
+    c._tls = ctx; // pin the ctx for the connection's lifetime
     return c;
   }
 
@@ -224,6 +324,20 @@ class TcpServer {
     if (!h) return null;
     const s = Object.create(TcpServer.prototype);
     s._handle = h;
+    return s;
+  }
+
+  /**
+   * Listen with TLS using a TlsCtx (borrowed; kept alive by the server).
+   * @param {number} port @param {TlsCtx} ctx @param {boolean} [nonBlocking=false]
+   * @returns {TcpServer|null}
+   */
+  static listenTls(port, ctx, nonBlocking = false) {
+    const h = native.tcpServerListenTls(port, ctx._handle, nonBlocking);
+    if (!h) return null;
+    const s = Object.create(TcpServer.prototype);
+    s._handle = h;
+    s._tls = ctx; // pin the ctx for the server's lifetime
     return s;
   }
 
@@ -383,13 +497,28 @@ module.exports = {
   /** @param {string} host @returns {string[]} all A records */
   dnsQueryA: (host) => native.dnsQueryA(host),
 
+  /** @param {string} host @returns {string[]} all AAAA (IPv6) records */
+  dnsQueryAaaa: (host) => native.dnsQueryAaaa(host),
+
   /** @returns {string|null} best-effort primary local IPv4 */
   localIpv4: () => native.localIpv4(),
+
+  /** @returns {boolean} true if a real TLS backend is compiled in */
+  tlsAvailable: () => native.tlsAvailable(),
+
+  /** @returns {string} the active TLS backend name (e.g. "openssl", "none") */
+  tlsBackendName: () => native.tlsBackendName(),
+
+  /*
+   * HTTP responses: `body` is a Buffer (raw bytes), so binary/compressed
+   * payloads are preserved intact. Use `r.body.toString()` for text. The
+   * helper below builds such a response and is shared by all verbs.
+   */
 
   /**
    * Synchronous HTTP GET.
    * @param {string} url
-   * @returns {{status:number, body:string, headersJson:string, statusText:string, version:string, protocol:string}}
+   * @returns {{status:number, body:Buffer, headersJson:string, statusText:string, version:string, protocol:string}}
    */
   httpGet: (url) => native.httpGet(url),
 
@@ -400,11 +529,34 @@ module.exports = {
    */
   httpPost: (url, body) => native.httpPost(url, Buffer.isBuffer(body) ? body : Buffer.from(body || '')),
 
+  /** Synchronous HTTP DELETE. @param {string} url */
+  httpDelete: (url) => native.httpDelete(url),
+
+  /** Synchronous HTTP PUT. @param {string} url @param {Buffer} [body] */
+  httpPut: (url, body) => native.httpPut(url, Buffer.isBuffer(body) ? body : Buffer.from(body || '')),
+
+  /**
+   * Arbitrary HTTP request.
+   * @param {string} method
+   * @param {string} url
+   * @param {Object<string,string>|Array<[string,string]>} [headers]
+   * @param {Buffer} [body]
+   */
+  httpRequest: (method, url, headers, body) => {
+    let pairs = [];
+    if (Array.isArray(headers)) pairs = headers.map(([k, v]) => [String(k), String(v)]);
+    else if (headers && typeof headers === 'object')
+      pairs = Object.entries(headers).map(([k, v]) => [String(k), String(v)]);
+    const b = body == null ? Buffer.alloc(0) : (Buffer.isBuffer(body) ? body : Buffer.from(body));
+    return native.httpRequest(method, url, pairs, b);
+  },
+
   Ring,
   Stream,
   MemoryStream,
   BufferSerial,
   CountSerial,
+  TlsCtx,
   TcpClient,
   TcpServer,
   UdpClient,

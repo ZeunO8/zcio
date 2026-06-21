@@ -196,6 +196,47 @@ def test_stream_verbs():
     m.close()
 
 
+def test_ring_as_stream_pins_parent():
+    """A non-owning ring stream must keep the parent Ring alive: dropping the
+    Ring reference and forcing GC must not free the ring out from under the
+    borrowing stream (UAF). The stream's ._parent should hold the Ring."""
+    import gc
+    r = zcio.Ring(64)
+    r.write(b"pinned")
+    s = r.as_stream(take_ownership=False)
+    assert s._parent is r, "non-owning ring stream should pin its parent Ring"
+    del r
+    gc.collect()
+    # The ring is still alive via s._parent; reading through the stream is safe.
+    assert s.read_full(6) == b"pinned"
+    s.close()
+
+
+def test_counting_stream():
+    # pure sizer (no buffer): tallies bytes written, stores nothing
+    cs = zcio.CountingStream()
+    assert cs.write(b"hello") == 5
+    assert cs.write(b"!!!") == 3
+    assert cs.bytes_written == 8
+    cs.close()
+    # buffer-backed: bytes pass through and can be read back
+    cb = zcio.CountingStream(32)
+    assert cb.write(b"abcd") == 4
+    assert cb.bytes_written == 4
+    cb.seek_read(0)
+    assert cb.read(4) == b"abcd"
+    assert cb.bytes_read == 4
+    cb.close()
+
+
+def test_stream_close():
+    m = zcio.MemoryStream(16)
+    m.write(b"x")
+    m.close()
+    # idempotent: a second close must not crash or double-free
+    m.close()
+
+
 def test_copy_ring_to_memory():
     r = zcio.Ring(64)
     r.write(b"payload-via-copy")
@@ -264,6 +305,56 @@ def test_tcp_two_clients_and_close():
     c1.close()
     c2.close()
     srv.close()
+
+
+# ---------------------------------------------------------------------------
+# TLS (threaded loopback; SKIP if no backend compiled in)
+# ---------------------------------------------------------------------------
+def test_tls_available():
+    # must not crash; returns a bool and a backend name string
+    avail = zcio.tls_available()
+    assert isinstance(avail, bool)
+    assert isinstance(zcio.tls_backend_name(), str)
+
+
+def test_tls_loopback():
+    if not zcio.tls_available():
+        raise SkipTest(f"no TLS backend (backend={zcio.tls_backend_name()!r})")
+    port = _free_port()
+    sctx = zcio.TlsCtx.server()
+    srv = zcio.TcpServer(port, tls=sctx)
+
+    result = {}
+
+    def server_thread():
+        try:
+            conn = srv.accept(3000)
+            if conn is None:
+                result["err"] = "server accept timed out"
+                return
+            data = conn.read_full(5)
+            if data == b"tlsok":
+                conn.write(data)
+                conn.flush()
+            else:
+                result["err"] = f"server got {data!r}"
+        except Exception as e:  # noqa: BLE001
+            result["err"] = f"server: {e}"
+
+    t = threading.Thread(target=server_thread)
+    t.start()
+    try:
+        cctx = zcio.TlsCtx.client("127.0.0.1")
+        cli = zcio.TcpClient("127.0.0.1", port, tls=cctx, verify=False)
+        cli.stream.write(b"tlsok")
+        cli.stream.flush()
+        echo = cli.stream.read_full(5)
+        assert echo == b"tlsok", (echo, result.get("err"))
+        cli.close()
+    finally:
+        t.join(5)
+        srv.close()
+    assert "err" not in result, result.get("err")
 
 
 # ---------------------------------------------------------------------------

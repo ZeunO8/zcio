@@ -105,8 +105,12 @@ public:
     int64_t write(std::string_view sv)     { return zcio_ring_write(r_, sv.data(), sv.size()); }
     size_t available() const { return zcio_ring_available_read(r_); }
 
-    // Borrowed stream view over this ring (ring must outlive it).
-    StreamRef as_stream() { return StreamRef(zcio_ring_as_stream(r_, false)); }
+    // Stream adapter over this ring. zcio_ring_as_stream ALLOCATES a fresh
+    // zcio_stream even when borrowing the ring, so the wrapper must be owned
+    // (and freed) by the caller -- hence an owning Stream, not a StreamRef.
+    // The ring is borrowed (take_ownership=false): this Ring must outlive the
+    // returned Stream. The Stream's destructor frees only the wrapper.
+    Stream as_stream() { return Stream(zcio_ring_as_stream(r_, false)); }
     zcio_ring* get() const noexcept { return r_; }
 
 private:
@@ -263,6 +267,8 @@ public:
     TcpClient& operator=(const TcpClient&) = delete;
     TcpClient(TcpClient&& o) noexcept : c_(o.c_) { o.c_ = nullptr; }
     ~TcpClient() { if (c_) zcio_tcp_client_free(c_); }
+    // Borrowed stream: owned by this client. This TcpClient must outlive any
+    // StreamRef returned here; do not use the ref after the client is destroyed.
     StreamRef stream() { return StreamRef(zcio_tcp_client_stream(c_)); }
 
     int tls_upgrade(TlsCtx& ctx) { return zcio_tcp_client_tls_upgrade(c_, ctx.get()); }
@@ -275,6 +281,8 @@ private:
 };
 
 // A borrowed accepted connection: id + non-owning stream + wait helpers.
+// The connection (and its `stream`) is owned by the parent TcpServer's
+// connection map; the server must outlive this TcpConn and its stream ref.
 struct TcpConn {
     size_t id = 0;
     StreamRef stream{nullptr};
@@ -328,6 +336,7 @@ public:
     UdpClient& operator=(const UdpClient&) = delete;
     UdpClient(UdpClient&& o) noexcept : c_(o.c_) { o.c_ = nullptr; }
     ~UdpClient() { if (c_) zcio_udp_client_free(c_); }
+    // Borrowed stream owned by this client; the client must outlive the ref.
     StreamRef stream() { return StreamRef(zcio_udp_client_stream(c_)); }
 
 private:
@@ -365,6 +374,7 @@ public:
     McastSender& operator=(const McastSender&) = delete;
     McastSender(McastSender&& o) noexcept : s_(o.s_) { o.s_ = nullptr; }
     ~McastSender() { if (s_) zcio_mcast_sender_free(s_); }
+    // Borrowed stream owned by this sender; the sender must outlive the ref.
     StreamRef stream() { return StreamRef(zcio_mcast_sender_stream(s_)); }
 
 private:
@@ -381,6 +391,7 @@ public:
     McastReceiver& operator=(const McastReceiver&) = delete;
     McastReceiver(McastReceiver&& o) noexcept : r_(o.r_) { o.r_ = nullptr; }
     ~McastReceiver() { if (r_) zcio_mcast_receiver_free(r_); }
+    // Borrowed stream owned by this receiver; the receiver must outlive the ref.
     StreamRef stream() { return StreamRef(zcio_mcast_receiver_stream(r_)); }
 
 private:

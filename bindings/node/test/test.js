@@ -249,11 +249,34 @@ test('http_get_post_loopback', async () => {
     const url = `http://127.0.0.1:${hport}/`;
     const r = zcio.httpGet(url);
     assert.strictEqual(r.status, 200, 'httpGet status 200');
-    assert.strictEqual(r.body, 'hello from node http', 'httpGet body matches');
+    // body is now a Buffer (binary-safe); compare as text via toString()
+    assert.ok(Buffer.isBuffer(r.body), 'httpGet body is a Buffer');
+    assert.strictEqual(r.body.toString(), 'hello from node http', 'httpGet body matches');
 
     const pr = zcio.httpPost(url, Buffer.from('payload123'));
     assert.strictEqual(pr.status, 200, 'httpPost status 200');
-    assert.strictEqual(pr.body, 'posted:payload123', 'httpPost echoes body');
+    assert.strictEqual(pr.body.toString(), 'posted:payload123', 'httpPost echoes body');
+  } finally {
+    child.kill();
+  }
+});
+
+test('http_verbs', async () => {
+  const { child, port: hport } = await startHttpServer();
+  try {
+    const url = `http://127.0.0.1:${hport}/`;
+    const del = zcio.httpDelete(url);
+    assert.strictEqual(del.status, 200, 'httpDelete status 200');
+    assert.strictEqual(del.body.toString(), 'deleted', 'httpDelete body');
+
+    const put = zcio.httpPut(url, Buffer.from('putbody'));
+    assert.strictEqual(put.status, 200, 'httpPut status 200');
+    assert.strictEqual(put.body.toString(), 'put:putbody', 'httpPut echoes body');
+
+    // httpRequest with a custom header (object form) the server echoes back
+    const req = zcio.httpRequest('GET', url, { 'X-Echo': 'hi-there' });
+    assert.strictEqual(req.status, 200, 'httpRequest status 200');
+    assert.strictEqual(req.body.toString(), 'echo:hi-there', 'httpRequest passes headers');
   } finally {
     child.kill();
   }

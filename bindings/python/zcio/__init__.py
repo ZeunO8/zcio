@@ -20,7 +20,9 @@ from typing import Optional
 __all__ = [
     "lib", "version", "is_ipv4", "resolve_ipv4", "local_ipv4",
     "dns_query_a", "dns_query_aaaa",
-    "Ring", "Serial", "MemoryStream", "Stream", "TcpClient", "TcpServer",
+    "tls_available", "tls_backend_name", "TlsCtx",
+    "Ring", "Serial", "MemoryStream", "CountingStream", "Stream",
+    "TcpClient", "TcpServer",
     "UdpClient", "UdpServer", "McastSender", "McastReceiver",
     "http_get", "http_post", "http_put", "http_delete", "http_request",
     "copy", "ZcioError",
@@ -132,6 +134,9 @@ _decl("zcio_serial_clear_read", None, _void_p)
 
 # stream
 _decl("zcio_memory_stream", _void_p, _void_p, c.c_size_t)
+_decl("zcio_counting_stream", _void_p, _void_p, c.c_size_t)
+_decl("zcio_counting_bytes_written", c.c_int64, _void_p)
+_decl("zcio_counting_bytes_read", c.c_int64, _void_p)
 _decl("zcio_stream_free", None, _void_p)
 _decl("zcio_read", c.c_int64, _void_p, _void_p, c.c_size_t)
 _decl("zcio_write", c.c_int64, _void_p, _void_p, c.c_size_t)
@@ -176,6 +181,16 @@ _decl("zcio_mcast_sender_stream", _void_p, _void_p)
 _decl("zcio_mcast_receiver_open", _void_p, c.c_char_p, c.c_int)
 _decl("zcio_mcast_receiver_free", None, _void_p)
 _decl("zcio_mcast_receiver_stream", _void_p, _void_p)
+
+# tls
+_decl("zcio_tls_available", c.c_bool)
+_decl("zcio_tls_backend_name", c.c_char_p)
+_decl("zcio_tls_client_ctx", _void_p, c.c_char_p)
+_decl("zcio_tls_server_ctx", _void_p)
+_decl("zcio_tls_server_ctx_files", _void_p, c.c_char_p, c.c_char_p)
+_decl("zcio_tls_ctx_free", None, _void_p)
+_decl("zcio_tcp_client_connect_tls", _void_p, c.c_char_p, c.c_int, _void_p, c.c_bool)
+_decl("zcio_tcp_server_listen_tls", _void_p, c.c_int, _void_p, c.c_bool)
 
 # dns
 _decl("zcio_is_ipv4", c.c_bool, c.c_char_p)
@@ -234,6 +249,16 @@ def version() -> str:
 
 def is_ipv4(s: str) -> bool:
     return bool(lib.zcio_is_ipv4(s.encode()))
+
+
+def tls_available() -> bool:
+    """True if a real TLS backend (not the 'none' stub) is compiled in."""
+    return bool(lib.zcio_tls_available())
+
+
+def tls_backend_name() -> str:
+    n = lib.zcio_tls_backend_name()
+    return n.decode() if n else ""
 
 
 def resolve_ipv4(host: str) -> Optional[str]:
@@ -300,7 +325,12 @@ class Ring:
             raise ZcioError("ring_as_stream failed")
         if take_ownership:
             self._h = None  # ring is now owned by the stream
-        return Stream(h, owns=True)
+            return Stream(h, owns=True)
+        # Non-owning: the stream wrapper is still ours to free (zcio_ring_as_stream
+        # allocates a fresh zcio_stream), but the underlying ring is borrowed. Keep
+        # a Python reference to this Ring so it cannot be GC'd (and freed) while the
+        # borrowing stream is still alive -- otherwise the stream would dangle.
+        return Stream(h, owns=True, parent=self)
 
     def close(self):
         if self._h:
@@ -484,15 +514,19 @@ class _Stream:
 class Stream(_Stream):
     """An owning wrapper over a zcio_stream handle (e.g. ring_as_stream)."""
 
-    def __init__(self, handle, owns: bool = True):
+    def __init__(self, handle, owns: bool = True, parent=None):
         super().__init__(handle)
         self._owns = owns
+        # Optional strong reference to a parent object the stream borrows from
+        # (e.g. a Ring), pinning its lifetime to ours so it cannot be freed first.
+        self._parent = parent
 
     def close(self):
         if self._h:
             if self._owns:
                 lib.zcio_stream_free(self._h)
             self._h = None
+        self._parent = None
 
     __del__ = close
 
@@ -502,6 +536,46 @@ class MemoryStream(_Stream):
         self._buf = buffer if buffer is not None else bytearray(size)
         self._carr = (c.c_char * len(self._buf)).from_buffer(self._buf)
         super().__init__(lib.zcio_memory_stream(self._carr, len(self._buf)))
+
+    def close(self):
+        if self._h:
+            lib.zcio_stream_free(self._h)
+            self._h = None
+
+    __del__ = close
+
+
+class CountingStream(_Stream):
+    """Byte-counting stream. With a buffer, bytes pass through it; otherwise it
+    is a pure sink/sizer. Query totals via bytes_written / bytes_read."""
+
+    def __init__(self, size: int = 0, buffer=None):
+        if buffer is not None:
+            self._buf = buffer
+        elif size > 0:
+            self._buf = bytearray(size)
+        else:
+            self._buf = None
+        if self._buf is not None:
+            self._carr = (c.c_char * len(self._buf)).from_buffer(self._buf)
+            super().__init__(lib.zcio_counting_stream(self._carr, len(self._buf)))
+        else:
+            self._carr = None
+            super().__init__(lib.zcio_counting_stream(None, 0))
+        if not self._h:
+            raise ZcioError("counting_stream allocation failed")
+
+    @property
+    def bytes_written(self) -> int:
+        return lib.zcio_counting_bytes_written(self._h)
+
+    @property
+    def bytes_read(self) -> int:
+        return lib.zcio_counting_bytes_read(self._h)
+
+    @property
+    def buffer(self):
+        return self._buf
 
     def close(self):
         if self._h:
@@ -526,11 +600,51 @@ class TcpConn:
         return lib.zcio_tcp_conn_wait_writable(self._h, timeout_ms)
 
 
+class TlsCtx:
+    """An opaque per-role TLS configuration (client or server). Borrowed by the
+    endpoints it is passed to -- the caller owns it and may share one ctx across
+    many connections, then release it (here, on GC / ctx_free())."""
+
+    def __init__(self, handle):
+        if not handle:
+            raise ZcioError(f"tls ctx creation failed: {lib.zcio_last_error().decode()}")
+        self._h = handle
+
+    @classmethod
+    def client(cls, host: str) -> "TlsCtx":
+        """Client context that verifies `host` (SNI + cert hostname)."""
+        return cls(lib.zcio_tls_client_ctx(host.encode()))
+
+    @classmethod
+    def server(cls) -> "TlsCtx":
+        """Server context with a generated self-signed cert."""
+        return cls(lib.zcio_tls_server_ctx())
+
+    @classmethod
+    def server_files(cls, cert_path: str, key_path: str) -> "TlsCtx":
+        """Server context from PEM cert/key file paths."""
+        return cls(lib.zcio_tls_server_ctx_files(cert_path.encode(), key_path.encode()))
+
+    def ctx_free(self):
+        if self._h:
+            lib.zcio_tls_ctx_free(self._h)
+            self._h = None
+
+    __del__ = ctx_free
+
+
 class TcpClient:
-    def __init__(self, host: str, port: int):
-        self._h = lib.zcio_tcp_client_connect(host.encode(), port)
+    def __init__(self, host: str, port: int, tls: Optional["TlsCtx"] = None,
+                 verify: bool = True):
+        if tls is not None:
+            self._h = lib.zcio_tcp_client_connect_tls(
+                host.encode(), port, tls._h, verify)
+        else:
+            self._h = lib.zcio_tcp_client_connect(host.encode(), port)
         if not self._h:
             raise ZcioError(f"tcp connect failed: {lib.zcio_last_error().decode()}")
+        # Keep the TLS ctx alive for the connection's lifetime (it is borrowed).
+        self._tls = tls
         self.stream = _Stream(lib.zcio_tcp_client_stream(self._h))
 
     def wait_readable(self, timeout_ms: int = 1000) -> int:
@@ -552,10 +666,16 @@ class TcpClient:
 
 
 class TcpServer:
-    def __init__(self, port: int):
-        self._h = lib.zcio_tcp_server_listen(port)
+    def __init__(self, port: int, tls: Optional["TlsCtx"] = None,
+                 non_blocking: bool = False):
+        if tls is not None:
+            self._h = lib.zcio_tcp_server_listen_tls(port, tls._h, non_blocking)
+        else:
+            self._h = lib.zcio_tcp_server_listen(port)
         if not self._h:
             raise ZcioError(f"tcp listen failed: {lib.zcio_last_error().decode()}")
+        # Keep the TLS ctx alive for the server's lifetime (it is borrowed).
+        self._tls = tls
 
     def accept(self, timeout_ms: int = 1000):
         """Accept one client, returning a borrowed _Stream (or None on timeout)."""
