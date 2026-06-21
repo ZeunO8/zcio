@@ -1,12 +1,29 @@
 'use strict';
 
+/* zcio Node binding test suite.
+ *
+ * Mirrors the C `ztest` harness output: each named test prints `[ ok ] <name>`,
+ * `[skip] <name>: <why>`, or `[FAIL] <name>: <error>`, then a final tally. The
+ * process exits non-zero if any test fails so CTest flags it. */
+
 const assert = require('assert');
 const { spawn } = require('child_process');
 const path = require('path');
 const zcio = require('..');
 
-let skips = 0;
-function skip(msg) { skips++; console.log('  SKIP:', msg); }
+/* ---- tiny runner -------------------------------------------------------- */
+const tests = [];
+function test(name, fn) { tests.push({ name, fn }); }
+
+class Skip extends Error {}
+function skip(msg) { throw new Skip(msg); }
+
+/* Synchronous sleep. The multicast receiver socket is non-blocking, so we must
+ * block the (single) JS thread between a send and the next poll to give the
+ * datagram time to loop back. Atomics.wait is the only synchronous sleep in
+ * Node that doesn't busy-spin. */
+const _sleepBuf = new Int32Array(new SharedArrayBuffer(4));
+function sleepSync(ms) { Atomics.wait(_sleepBuf, 0, 0, ms); }
 
 /* Randomize a port base per run so repeated runs don't collide with sockets
  * lingering in TIME_WAIT. */
@@ -14,43 +31,37 @@ const PORT_BASE = 20000 + Math.floor(Math.random() * 20000);
 let nextPort = PORT_BASE;
 function port() { return nextPort++; }
 
-/* ---------------------------------------------------------------- version */
-const v = zcio.version();
-console.log('zcio version:', v);
-assert.strictEqual(typeof v, 'string');
-assert.ok(v.length > 0, 'version string should be non-empty');
+/* ---- tests -------------------------------------------------------------- */
+test('version', () => {
+  const v = zcio.version();
+  assert.strictEqual(typeof v, 'string');
+  assert.ok(v.length > 0, 'version string should be non-empty');
+});
 
-/* ------------------------------------------------------------------ isIpv4 */
-assert.strictEqual(zcio.isIpv4('127.0.0.1'), true, '127.0.0.1 is IPv4');
-assert.strictEqual(zcio.isIpv4('not.an.ip'), false, 'garbage is not IPv4');
-assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
+test('isIpv4', () => {
+  assert.strictEqual(zcio.isIpv4('127.0.0.1'), true, '127.0.0.1 is IPv4');
+  assert.strictEqual(zcio.isIpv4('not.an.ip'), false, 'garbage is not IPv4');
+  assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
+});
 
-/* -------------------------------------------------------------------- Ring */
-{
+test('ring_roundtrip', () => {
   const ring = new zcio.Ring(1024);
   const payload = Buffer.from('hello zcio ring');
-  const wrote = ring.write(payload);
-  assert.strictEqual(wrote, payload.length, 'wrote all bytes');
+  assert.strictEqual(ring.write(payload), payload.length, 'wrote all bytes');
   assert.strictEqual(ring.availableRead(), payload.length, 'available == written');
   const got = ring.read(payload.length);
   assert.ok(Buffer.isBuffer(got), 'read returns a Buffer');
   assert.strictEqual(got.toString(), payload.toString(), 'roundtrip matches');
   ring.free();
-}
+});
 
-/* --------------------------------------------------- BufferSerial: scalars */
-{
+test('serial_scalars', () => {
   const s = new zcio.BufferSerial(512);
-  s.writeI8(-5);
-  s.writeU8(250);
-  s.writeI16(-1234);
-  s.writeU16(60000);
-  s.writeI32(0x1234abcd | 0);
-  s.writeU32(0xdeadbeef >>> 0);
-  s.writeI64(-9007199254740993n);
-  s.writeU64(18446744073709551610n);
-  s.writeF32(1.5);
-  s.writeF64(3.141592653589793);
+  s.writeI8(-5); s.writeU8(250);
+  s.writeI16(-1234); s.writeU16(60000);
+  s.writeI32(0x1234abcd | 0); s.writeU32(0xdeadbeef >>> 0);
+  s.writeI64(-9007199254740993n); s.writeU64(18446744073709551610n);
+  s.writeF32(1.5); s.writeF64(3.141592653589793);
   s.writeStr('serialized');
   s.writeBytes(Buffer.from([1, 2, 3, 4, 5]));
 
@@ -67,10 +78,9 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   assert.strictEqual(s.readF64(), 3.141592653589793, 'f64');
   assert.strictEqual(s.readStr(), 'serialized', 'string');
   assert.deepStrictEqual([...s.readBytes(5)], [1, 2, 3, 4, 5], 'bytes');
-}
+});
 
-/* ----------------------------------------------------- BufferSerial: bits */
-{
+test('serial_bits', () => {
   const s = new zcio.BufferSerial(64, true /* bitStream */);
   const bits = [true, false, true, true, false, false, false, true];
   for (const b of bits) s.writeBit(b);
@@ -78,22 +88,19 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   for (let i = 0; i < bits.length; i++) {
     assert.strictEqual(s.readBit(), bits[i], `bit ${i}`);
   }
-}
+});
 
-/* ------------------------------------------------- CountSerial: sizing pass */
-{
+test('serial_count_sizing', () => {
   const c = new zcio.CountSerial();
-  c.writeI32(0);          // 4
-  c.writeU16(0);          // 2
-  c.writeF64(0);          // 8
-  c.writeBytes(Buffer.alloc(10)); // 10
-  c.writeStr('abc');      // 8 (u64 len) + 3
-  // total = 4 + 2 + 8 + 10 + 8 + 3 = 35
+  c.writeI32(0);                   // 4
+  c.writeU16(0);                   // 2
+  c.writeF64(0);                   // 8
+  c.writeBytes(Buffer.alloc(10));  // 10
+  c.writeStr('abc');               // 8 (u64 len) + 3
   assert.strictEqual(Number(c.writeLen()), 35, 'count-mode sizing total');
-}
+});
 
-/* ----------------------------------------- Stream verbs: ring -> memory copy */
-{
+test('stream_copy_ring_to_memory', () => {
   const ring = new zcio.Ring(256);
   const payload = Buffer.from('copy me through a stream');
   ring.write(payload);
@@ -102,12 +109,11 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   const copied = mem.copyFrom(rstream, payload.length);
   assert.strictEqual(copied, payload.length, 'copied all bytes');
   assert.strictEqual(mem.buffer.slice(0, payload.length).toString(), payload.toString(),
-    'memory stream backing buffer holds the copied data');
+    'memory stream holds the copied data');
   ring.free();
-}
+});
 
-/* ------------------------------------------------------- TCP loopback round-trip */
-{
+test('tcp_loopback', () => {
   const PORT = port();
   const server = zcio.TcpServer.listen(PORT);
   assert.ok(server, 'tcp server listening');
@@ -119,24 +125,19 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   assert.strictEqual(typeof accepted.id, 'number', 'accept returns numeric id');
 
   const msg = Buffer.from('ping over tcp');
-  const wrote = client.stream().write(msg);
-  assert.strictEqual(wrote, msg.length, 'client wrote full message');
+  assert.strictEqual(client.stream().write(msg), msg.length, 'client wrote full message');
+  assert.strictEqual(accepted.stream.readFull(msg.length).toString(), msg.toString(),
+    'tcp loopback roundtrip');
 
-  const got = accepted.stream.readFull(msg.length);
-  assert.strictEqual(got.toString(), msg.toString(), 'tcp loopback roundtrip');
-
-  // echo back
   const reply = Buffer.from('pong');
   accepted.stream.write(reply);
-  const back = client.stream().readFull(reply.length);
-  assert.strictEqual(back.toString(), reply.toString(), 'tcp reverse roundtrip');
+  assert.strictEqual(client.stream().readFull(reply.length).toString(), reply.toString(),
+    'tcp reverse roundtrip');
 
-  client.free();
-  server.free();
-}
+  client.free(); server.free();
+});
 
-/* -------------------------------------------- TCP 2-client accept + closeClient */
-{
+test('tcp_two_clients_close', () => {
   const PORT = port();
   const server = zcio.TcpServer.listen(PORT);
   assert.ok(server, 'tcp server listening (2-client)');
@@ -149,20 +150,17 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   assert.ok(a1 && a2, 'accepted two clients');
   assert.notStrictEqual(a1.id, a2.id, 'distinct client ids');
 
-  const rc = server.closeClient(a1.id);
-  assert.ok(rc >= 0, 'closeClient succeeded');
+  assert.ok(server.closeClient(a1.id) >= 0, 'closeClient succeeded');
 
-  // a2 still usable
   const m = Buffer.from('still here');
   c2.stream().write(m);
-  const got = a2.stream.readFull(m.length);
-  assert.strictEqual(got.toString(), m.toString(), 'second client still works after closing first');
+  assert.strictEqual(a2.stream.readFull(m.length).toString(), m.toString(),
+    'second client still works after closing first');
 
   c1.free(); c2.free(); server.free();
-}
+});
 
-/* -------------------------------------------------------- UDP loopback */
-{
+test('udp_loopback', () => {
   const PORT = port();
   const server = zcio.UdpServer.bind(PORT);
   assert.ok(server, 'udp server bound');
@@ -170,78 +168,64 @@ assert.strictEqual(zcio.isIpv4('::1'), false, 'IPv6 is not IPv4');
   assert.ok(client, 'udp client open');
 
   const msg = Buffer.from('datagram');
-  const wrote = client.stream().write(msg);
-  assert.strictEqual(wrote, msg.length, 'udp client wrote datagram');
+  assert.strictEqual(client.stream().write(msg), msg.length, 'udp client wrote datagram');
 
-  // receive with a short blocking timeout
   const pkt = server.receive(false, 500000 /* 500ms */);
-  if (!pkt) {
-    skip('UDP loopback: no datagram received within timeout');
-  } else {
-    const got = pkt.read(msg.length);
-    assert.strictEqual(got.toString(), msg.toString(), 'udp loopback roundtrip');
+  try {
+    if (!pkt) skip('no datagram received within timeout');
+    assert.strictEqual(pkt.read(msg.length).toString(), msg.toString(), 'udp loopback roundtrip');
+  } finally {
+    client.free(); server.free();
   }
-  client.free(); server.free();
-}
+});
 
-/* ----------------------------------------------- Multicast best-effort loopback */
-{
+test('multicast_loopback', () => {
   const GROUP = '239.255.42.99';
   const PORT = port();
   const recv = zcio.McastReceiver.open(GROUP, PORT);
   const send = zcio.McastSender.open(GROUP, PORT);
   if (!recv || !send) {
-    skip('Multicast: could not open sender/receiver (no multicast route)');
-  } else {
-    // exercise open/stream/free regardless
+    if (recv) recv.free();
+    if (send) send.free();
+    skip('could not open sender/receiver (no multicast route)');
+  }
+  try {
     const msg = Buffer.from('mcast hello');
-    send.stream().write(msg);
-    // best-effort, short non-fatal read
     let got = null;
-    try { got = recv.stream().read(msg.length); } catch (_) { got = null; }
-    if (!got || got.length === 0) {
-      skip('Multicast: no datagram arrived in short window (open/stream/free still exercised)');
-    } else {
-      assert.strictEqual(got.toString(), msg.toString(), 'multicast loopback roundtrip');
+    // Resend + poll with short sleeps, mirroring the C test, so the looped-back
+    // datagram has time to arrive on the non-blocking receiver socket.
+    for (let attempt = 0; attempt < 10 && !got; attempt++) {
+      send.stream().write(msg);
+      for (let i = 0; i < 20 && !got; i++) {
+        let r = null;
+        try { r = recv.stream().read(msg.length); } catch (_) { r = null; }
+        if (r && r.length >= msg.length) got = r;
+        else sleepSync(5);
+      }
     }
+    if (!got) skip('no multicast loopback route on this host');
+    assert.strictEqual(got.toString(), msg.toString(), 'multicast loopback roundtrip');
+  } finally {
     send.free(); recv.free();
   }
-}
+});
 
-/* ------------------------------------------------------------------- DNS */
-{
-  // localhost resolves to a loopback literal
+test('dns', () => {
   const ip = zcio.resolveIpv4('localhost');
-  if (ip === null) {
-    skip('DNS: resolveIpv4(localhost) returned null');
-  } else {
+  if (ip !== null) {
     assert.strictEqual(typeof ip, 'string', 'resolveIpv4 returns a string');
     assert.ok(zcio.isIpv4(ip), 'resolved localhost is a valid IPv4 literal');
   }
-
   const a = zcio.dnsQueryA('localhost');
   assert.ok(Array.isArray(a), 'dnsQueryA returns an array');
-  if (a.length === 0) {
-    skip('DNS: dnsQueryA(localhost) returned no records');
-  } else {
-    for (const rec of a) assert.strictEqual(typeof rec, 'string', 'A record is a string');
-  }
-
+  for (const rec of a) assert.strictEqual(typeof rec, 'string', 'A record is a string');
   const local = zcio.localIpv4();
-  if (local === null) {
-    skip('DNS: localIpv4() returned null (no route)');
-  } else {
-    assert.ok(zcio.isIpv4(local), 'localIpv4 is a valid IPv4 literal');
-  }
-
-  // literal passes through
+  if (local !== null) assert.ok(zcio.isIpv4(local), 'localIpv4 is a valid IPv4 literal');
   assert.strictEqual(zcio.resolveIpv4('8.8.8.8'), '8.8.8.8', 'IPv4 literal resolves to itself');
-}
+});
 
-/* ------------------------------------------------- HTTP against local server
- * zcio's HTTP client is synchronous and blocks the event loop, so the test
- * server must run in a separate process. server.js prints "PORT <n>" once
- * listening, then serves until killed. */
+/* zcio's HTTP client is synchronous and blocks the event loop, so the test
+ * server runs in a separate process (http_server.js prints "PORT <n>"). */
 function startHttpServer() {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [path.join(__dirname, 'http_server.js')], {
@@ -259,15 +243,13 @@ function startHttpServer() {
   });
 }
 
-async function httpTests() {
-  const { child, port } = await startHttpServer();
+test('http_get_post_loopback', async () => {
+  const { child, port: hport } = await startHttpServer();
   try {
-    const url = `http://127.0.0.1:${port}/`;
-    const body = 'hello from node http';
-
+    const url = `http://127.0.0.1:${hport}/`;
     const r = zcio.httpGet(url);
     assert.strictEqual(r.status, 200, 'httpGet status 200');
-    assert.strictEqual(r.body, body, 'httpGet body matches');
+    assert.strictEqual(r.body, 'hello from node http', 'httpGet body matches');
 
     const pr = zcio.httpPost(url, Buffer.from('payload123'));
     assert.strictEqual(pr.status, 200, 'httpPost status 200');
@@ -275,20 +257,36 @@ async function httpTests() {
   } finally {
     child.kill();
   }
-}
+});
 
-/* --------------------------------------------------- HTTP GET against a bad host */
-function httpBadHostTest() {
+test('http_bad_host', () => {
   // .invalid is reserved to never resolve (RFC 6761); must not crash.
   const r = zcio.httpGet('http://nonexistent.host.invalid:1/');
   assert.strictEqual(r.status, 0, 'bad host returns status 0 without crashing');
-}
-
-(async () => {
-  await httpTests();
-  httpBadHostTest();
-  console.log(`\nAll tests passed.${skips ? ` (${skips} skip${skips > 1 ? 's' : ''})` : ''}`);
-})().catch((e) => {
-  console.error('TEST FAILED:', e && e.stack ? e.stack : e);
-  process.exit(1);
 });
+
+/* ---- run ---------------------------------------------------------------- */
+(async () => {
+  console.log('zcio version:', zcio.version());
+  let pass = 0, fail = 0, skipped = 0;
+  for (const t of tests) {
+    try {
+      await t.fn();
+      pass++;
+      console.log(`[ ok ] ${t.name}`);
+    } catch (e) {
+      if (e instanceof Skip) {
+        skipped++;
+        console.log(`[skip] ${t.name}: ${e.message}`);
+      } else {
+        fail++;
+        console.log(`[FAIL] ${t.name}: ${e && e.stack ? e.stack : e}`);
+      }
+    }
+  }
+  let line = `\n${pass}/${tests.length} tests passed`;
+  if (skipped) line += `, ${skipped} skipped`;
+  if (fail) line += `, ${fail} failed`;
+  console.log(line);
+  process.exit(fail ? 1 : 0);
+})();

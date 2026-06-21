@@ -30,3 +30,51 @@ if(NOT WIN32)
     target_link_libraries(test_http         PRIVATE Threads::Threads)
     target_link_libraries(test_net_advanced PRIVATE Threads::Threads)
 endif()
+
+# ---------------------------------------------------------------------------
+# Language-binding tests (C++ / Python / Node) run as part of the same suite.
+# C++ only needs a C++ compiler; Python and Node load the shared lib, so they
+# are registered only when ZCIO_BUILD_SHARED produced the zcio_shared target.
+# ---------------------------------------------------------------------------
+option(ZCIO_BUILD_BINDING_TESTS "Register C++/Python/Node binding tests in CTest" ON)
+
+if(ZCIO_BUILD_BINDING_TESTS)
+    # --- C++ header-only RAII wrapper ---
+    enable_language(CXX)
+    find_package(Threads REQUIRED)
+    add_executable(binding_cpp ${CMAKE_CURRENT_SOURCE_DIR}/bindings/cpp/test_zcio.cpp)
+    target_link_libraries(binding_cpp PRIVATE zcio Threads::Threads)
+    target_include_directories(binding_cpp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    set_target_properties(binding_cpp PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+    add_test(NAME binding_cpp COMMAND binding_cpp)
+
+    if(TARGET zcio_shared)
+        # --- Python (ctypes) ---
+        find_program(ZCIO_PYTHON3 NAMES python3 python)
+        if(ZCIO_PYTHON3)
+            add_test(NAME binding_python
+                COMMAND ${ZCIO_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/bindings/python/test_zcio.py)
+            set_tests_properties(binding_python PROPERTIES
+                ENVIRONMENT "ZCIO_LIBRARY=$<TARGET_FILE:zcio_shared>")
+        else()
+            message(STATUS "zcio: python3 not found -- skipping Python binding test")
+        endif()
+
+        # --- Node (N-API) ---
+        find_program(ZCIO_NODE NAMES node)
+        find_program(ZCIO_NPX  NAMES npx)
+        if(ZCIO_NODE AND ZCIO_NPX)
+            add_test(NAME binding_node COMMAND ${CMAKE_COMMAND}
+                -DNODE=${ZCIO_NODE} -DNPX=${ZCIO_NPX}
+                -DNODE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/bindings/node
+                -DLIB_DIR=$<TARGET_FILE_DIR:zcio_shared>
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_node_test.cmake)
+            # node-gyp rebuild can be slow on the first run; give it room.
+            set_tests_properties(binding_node PROPERTIES TIMEOUT 300)
+        else()
+            message(STATUS "zcio: node/npx not found -- skipping Node binding test")
+        endif()
+    else()
+        message(STATUS "zcio: Python/Node binding tests need -DZCIO_BUILD_SHARED=ON (skipped)")
+    endif()
+endif()

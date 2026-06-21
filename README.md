@@ -54,6 +54,13 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+A single `ctest` run drives the whole suite: the C tests **and** the language
+bindings (C++, Python, Node). The C++ binding test only needs a C++ compiler;
+the Python (ctypes) and Node (N-API) binding tests load the shared library, so
+they are registered only when `-DZCIO_BUILD_SHARED=ON` and `python3` / `node`
+are found (otherwise they are skipped with a message, never failed). The Node
+test compiles its native addon on demand via `node-gyp`.
+
 ### Build options
 
 | Option | Default | Meaning |
@@ -62,6 +69,7 @@ ctest --test-dir build --output-on-failure
 | `ZCIO_WITH_ARCHIVE` | `OFF` | libarchive support (FetchContent-clones a fork; opt in) |
 | `ZCIO_BUILD_TESTS` | `ON` | build the C test suite |
 | `ZCIO_BUILD_SHARED` | `OFF` | also build `libzcio` shared (needed for the Python/Node bindings) |
+| `ZCIO_BUILD_BINDING_TESTS` | `ON` | register the C++/Python/Node binding tests in CTest |
 
 To build with no TLS dependency at all: `-DZCIO_TLS=none`.
 
