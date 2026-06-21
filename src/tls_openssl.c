@@ -16,6 +16,10 @@
 
 #include <limits.h>
 
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -110,18 +114,30 @@ static int zcio_bio_destroy(BIO *b) {
     return 1;
 }
 
-static BIO_METHOD *zcio_bio_method(void) {
-    if (g_bio_method) return g_bio_method;
+/* Build the BIO method exactly once and publish it in g_bio_method. */
+static void zcio_bio_method_init(void) {
     int type = BIO_get_new_index() | BIO_TYPE_SOURCE_SINK;
     BIO_METHOD *m = BIO_meth_new(type, "zcio_stream");
-    if (!m) return NULL;
+    if (!m) return; /* g_bio_method stays NULL; callers report the failure */
     BIO_meth_set_write(m, zcio_bio_write);
     BIO_meth_set_read(m, zcio_bio_read);
     BIO_meth_set_ctrl(m, zcio_bio_ctrl);
     BIO_meth_set_create(m, zcio_bio_create);
     BIO_meth_set_destroy(m, zcio_bio_destroy);
     g_bio_method = m;
-    return m;
+}
+
+static BIO_METHOD *zcio_bio_method(void) {
+#ifndef _WIN32
+    /* Thread-safe one-time init: avoids a data race / leak when two threads
+     * create their first TLS stream concurrently. */
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, zcio_bio_method_init);
+#else
+    /* Windows fallback: lazy init (matches the original behavior). */
+    if (!g_bio_method) zcio_bio_method_init();
+#endif
+    return g_bio_method;
 }
 
 /* ===========================================================================
@@ -132,6 +148,7 @@ typedef struct tls_stream {
     SSL         *ssl;
     BIO         *bio;    /* the zcio_stream BIO; owned by ssl after SSL_set_bio */
     zcio_stream *plain;  /* owned: freed on destroy */
+    bool         shut;   /* close_notify already sent; shutdown runs once       */
 } tls_stream;
 
 static int64_t tls_strm_read(void *vctx, void *dst, size_t n) {
@@ -192,9 +209,10 @@ static int tls_strm_flush(void *vctx) {
 
 static int tls_strm_close(void *vctx) {
     tls_stream *t = (tls_stream *)vctx;
-    if (t->ssl) {
+    if (t->ssl && !t->shut) {
         int ret = SSL_shutdown(t->ssl);
         if (ret == 0) SSL_shutdown(t->ssl); /* bidirectional close_notify */
+        t->shut = true;
     }
     return zcio_close(t->plain);
 }
@@ -203,8 +221,9 @@ static void tls_strm_destroy(void *vctx) {
     tls_stream *t = (tls_stream *)vctx;
     if (!t) return;
     if (t->ssl) {
-        /* Best-effort close_notify; ignore result during teardown. */
-        SSL_shutdown(t->ssl);
+        /* Best-effort close_notify; ignore result during teardown. Skip if
+         * tls_strm_close already sent it. */
+        if (!t->shut) SSL_shutdown(t->ssl);
         SSL_free(t->ssl); /* also frees the BIO attached via SSL_set_bio */
     }
     if (t->plain) zcio_stream_free(t->plain); /* take ownership of plain */
@@ -425,8 +444,14 @@ static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
             SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
         }
         if (ctx->host && *ctx->host) {
-            /* SNI. Cast away const: the API stores a copy internally in 1.1+. */
-            SSL_set_tlsext_host_name(ssl, ctx->host);
+            /* SNI. Cast away const: the API stores a copy internally in 1.1+.
+             * Returns 1 on success; treat failure as fatal so we never proceed
+             * without the SNI/verify host the caller asked for. */
+            if (SSL_set_tlsext_host_name(ssl, ctx->host) != 1) {
+                tls_set_ossl_error("SSL_set_tlsext_host_name");
+                SSL_free(ssl); /* frees bio; leaves plain untouched */
+                return NULL;
+            }
         }
     }
 
@@ -448,6 +473,20 @@ static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
         tls_set_ossl_error(is_server ? "SSL_accept" : "SSL_connect");
         SSL_free(ssl); /* frees bio; leaves plain untouched */
         return NULL;
+    }
+
+    /* Defense in depth: for a verifying client, require that the peer chain
+     * actually validated. SSL_VERIFY_PEER usually aborts the handshake on
+     * failure, but assert X509_V_OK explicitly so a misconfiguration can never
+     * yield a "successful" handshake over an unverified peer. */
+    if (!is_server && verify) {
+        long vr = SSL_get_verify_result(ssl);
+        if (vr != X509_V_OK) {
+            zcio_fail_(ZCIO_ERR_TLS, "TLS certificate verification failed: %s",
+                       X509_verify_cert_error_string(vr));
+            SSL_free(ssl); /* frees bio; leaves plain untouched */
+            return NULL;
+        }
     }
 
     tls_stream *t = (tls_stream *)zcio_xcalloc(1, sizeof *t);

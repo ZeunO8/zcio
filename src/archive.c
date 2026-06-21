@@ -29,6 +29,11 @@ bool zcio_archive_available(void) {
 #include <archive.h>
 #include <archive_entry.h>
 
+/* Hard cap on a single entry's in-memory size. archive_entry_size() is
+ * attacker-controlled (it comes from the archive header), so a hostile archive
+ * could otherwise request a multi-GiB allocation. 256 MiB. */
+#define ZCIO_ARCHIVE_MAX_ENTRY ((size_t)256 * 1024 * 1024)
+
 struct zcio_archive {
     zcio_archive_mode    mode;
     char                *path;
@@ -46,19 +51,30 @@ struct zcio_archive {
 
 /* ----------------------------- write helpers ---------------------------- */
 
-static void flush_write_entry(zcio_archive *a) {
-    if (!a->write_arc || !a->entry) return;
+/* Flush the pending write entry. Returns ZCIO_OK or a negated result; the
+ * entry/buffer is always released so the handle stays in a clean state. */
+static int flush_write_entry(zcio_archive *a) {
+    if (!a->write_arc || !a->entry) return ZCIO_OK;
+    int rc = ZCIO_OK;
     archive_entry_set_size(a->entry, (int64_t)a->wlen);
     archive_entry_set_filetype(a->entry, AE_IFREG);
     archive_entry_set_perm(a->entry, 0644);
-    archive_write_header(a->write_arc, a->entry);
-    if (a->wlen)
-        archive_write_data(a->write_arc, a->wbuf, a->wlen);
+    if (archive_write_header(a->write_arc, a->entry) != ARCHIVE_OK) {
+        rc = zcio_fail_(ZCIO_ERR_ARCHIVE, "archive: write header failed: %s",
+                        archive_error_string(a->write_arc));
+    } else if (a->wlen) {
+        la_ssize_t w = archive_write_data(a->write_arc, a->wbuf, a->wlen);
+        if (w < 0 || (size_t)w != a->wlen) {
+            rc = zcio_fail_(ZCIO_ERR_ARCHIVE, "archive: write data failed: %s",
+                            archive_error_string(a->write_arc));
+        }
+    }
     archive_entry_free(a->entry);
     a->entry = NULL;
     free(a->wbuf);
     a->wbuf = NULL;
     a->wlen = a->wcap = 0;
+    return rc;
 }
 
 /* ------------------------------ open/close ------------------------------ */
@@ -96,7 +112,7 @@ zcio_archive *zcio_archive_open(const char *path, zcio_archive_mode mode) {
 void zcio_archive_close(zcio_archive *a) {
     if (!a) return;
     if (a->mode == ZCIO_ARCHIVE_WRITE && a->write_arc) {
-        if (a->entry) flush_write_entry(a);
+        if (a->entry) (void)flush_write_entry(a); /* best-effort on teardown */
         archive_write_close(a->write_arc);
         archive_write_free(a->write_arc);
     }
@@ -166,7 +182,10 @@ int zcio_archive_set_entry(zcio_archive *a, const char *name) {
 
     if (a->mode == ZCIO_ARCHIVE_WRITE) {
         /* flush the previous entry, then start a new one. */
-        if (a->entry) flush_write_entry(a);
+        if (a->entry) {
+            int fr = flush_write_entry(a);
+            if (fr != ZCIO_OK) return fr;
+        }
         a->entry = archive_entry_new();
         if (!a->entry) return zcio_fail_(ZCIO_ERR_ARCHIVE, "archive: archive_entry_new failed");
         archive_entry_set_pathname(a->entry, name);
@@ -195,16 +214,34 @@ int zcio_archive_set_entry(zcio_archive *a, const char *name) {
         if (pname && strcmp(pname, name) == 0) {
             int64_t size = archive_entry_size(e);
             if (size < 0) size = 0;
-            char *buf = (char *)zcio_xmalloc((size_t)size + 1);
+            /* archive_entry_size() is attacker-controlled; refuse absurd sizes
+             * before allocating to avoid a memory-exhaustion DoS. */
+            if ((uint64_t)size > ZCIO_ARCHIVE_MAX_ENTRY) {
+                archive_read_close(arc); archive_read_free(arc);
+                return zcio_fail_(ZCIO_ERR_ARCHIVE,
+                                  "archive: entry '%s' size %lld exceeds %zu byte limit",
+                                  name, (long long)size, ZCIO_ARCHIVE_MAX_ENTRY);
+            }
+            size_t want = (size_t)size;
+            char *buf = (char *)zcio_xmalloc(want + 1);
             if (!buf) {
                 archive_read_close(arc); archive_read_free(arc);
                 return zcio_fail_(ZCIO_ERR_NOMEM, "archive: out of memory");
             }
             size_t got = 0;
-            while (got < (size_t)size) {
-                la_ssize_t r = archive_read_data(arc, buf + got, (size_t)size - got);
-                if (r <= 0) break;
+            bool read_err = false;
+            while (got < want) {
+                la_ssize_t r = archive_read_data(arc, buf + got, want - got);
+                if (r < 0) { read_err = true; break; } /* decode/IO error */
+                if (r == 0) break;                     /* short entry / EOF */
                 got += (size_t)r;
+            }
+            if (read_err || got != want) {
+                free(buf);
+                archive_read_close(arc); archive_read_free(arc);
+                return zcio_fail_(ZCIO_ERR_ARCHIVE,
+                                  "archive: entry '%s' truncated or unreadable (got %zu of %zu): %s",
+                                  name, got, want, archive_error_string(arc));
             }
             buf[got] = '\0';
             a->rbuf = buf;

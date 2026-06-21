@@ -48,6 +48,29 @@ typedef int zcio_socket;
 void zcio_socket_startup(void);
 int  zcio_set_nonblocking(zcio_socket fd, bool on);
 
+/* --- SIGPIPE suppression ------------------------------------------------ *
+ * A send to a peer-closed socket must never raise SIGPIPE (which by default
+ * kills the whole host process). Two complementary mechanisms:
+ *   - ZCIO_SEND_FLAGS: OR into every send()/sendto() (MSG_NOSIGNAL on Linux).
+ *   - zcio_socket_nosigpipe(fd): set SO_NOSIGPIPE right after socket() on
+ *     macOS/BSD, where MSG_NOSIGNAL does not exist. No-op on Linux/Windows. */
+#if defined(MSG_NOSIGNAL)
+#  define ZCIO_SEND_FLAGS MSG_NOSIGNAL
+#else
+#  define ZCIO_SEND_FLAGS 0
+#endif
+void zcio_socket_nosigpipe(zcio_socket fd);
+
+/* --- EINTR-safe blocking helpers ---------------------------------------- *
+ * Wrap select() so a benign signal does not corrupt an otherwise-healthy
+ * operation. Retries on EINTR while shrinking the remaining timeout so a
+ * stream of signals cannot extend the deadline indefinitely.
+ *   timeout_ms < 0  -> block indefinitely
+ *   timeout_ms == 0 -> poll
+ * Returns the select() result (>0 ready, 0 timeout, <0 error). */
+int zcio_select_eintr(zcio_socket fd, bool want_read, bool want_write,
+                      bool *out_read, bool *out_write, int timeout_ms);
+
 /* --- tiny allocation helpers -------------------------------------------- */
 static inline void *zcio_xmalloc(size_t n) { return malloc(n ? n : 1); }
 static inline void *zcio_xcalloc(size_t n, size_t sz) { return calloc(n ? n : 1, sz ? sz : 1); }

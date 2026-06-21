@@ -91,9 +91,12 @@ int64_t zcio_copy(zcio_stream *dst, zcio_stream *src, size_t limit) {
     if (!dst || !src) return ZCIO_ERR_INVALID_ARG;
     char buf[16384];
     int64_t total = 0;
-    while (total < (int64_t)limit) {
+    /* SIZE_MAX means "until EOF" (see stream.h). Casting it to int64_t yields
+     * -1, which would skip the loop, so handle the unbounded case explicitly. */
+    bool unbounded = (limit == SIZE_MAX);
+    while (unbounded || total < (int64_t)limit) {
         size_t want = sizeof buf;
-        if (limit - (size_t)total < want) want = limit - (size_t)total;
+        if (!unbounded && limit - (size_t)total < want) want = limit - (size_t)total;
         int64_t r = zcio_read(src, buf, want);
         if (r < 0) return total ? total : r;
         if (r == 0) break;

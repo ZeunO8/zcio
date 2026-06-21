@@ -87,12 +87,20 @@ static int64_t raw_write(zcio_serial *z, const char *src, size_t size) {
             z->count_total += size;
             z->count_wpos += size;
             return (int64_t)size;
-        case MODE_BUFFER:
-            if (z->buf_wpos <= z->buf_size - (int64_t)size) {
-                memcpy(z->buf + z->buf_wpos, src, size);
-                z->buf_wpos += (int64_t)size;
+        case MODE_BUFFER: {
+            /* buf_wpos/buf_size are non-negative; compute remaining capacity
+             * without the signed `buf_size - (int64_t)size` underflow. */
+            uint64_t cap  = (uint64_t)z->buf_size - (uint64_t)z->buf_wpos;
+            if ((uint64_t)size > cap) {
+                /* doesn't fit: copy nothing and report the honest count (0). */
+                zcio_fail_(ZCIO_ERR, "serial buffer write overflow: %zu byte(s) into %llu remaining",
+                           size, (unsigned long long)cap);
+                return 0;
             }
+            memcpy(z->buf + z->buf_wpos, src, size);
+            z->buf_wpos += (int64_t)size;
             return (int64_t)size;
+        }
         case MODE_STREAM:
         default:
             return zcio_write_full(z->stream, src, size);
@@ -105,8 +113,10 @@ static int64_t raw_read(zcio_serial *z, char *dst, size_t size) {
             z->count_rpos += size;
             z->last_read = size;
             return (int64_t)size;
-        case MODE_BUFFER:
-            if (z->buf_rpos <= z->buf_size - (int64_t)size) {
+        case MODE_BUFFER: {
+            /* avoid signed `buf_size - (int64_t)size` underflow */
+            uint64_t cap = (uint64_t)z->buf_size - (uint64_t)z->buf_rpos;
+            if ((uint64_t)size <= cap) {
                 memcpy(dst, z->buf + z->buf_rpos, size);
                 z->buf_rpos += (int64_t)size;
                 z->last_read = size;
@@ -115,10 +125,19 @@ static int64_t raw_read(zcio_serial *z, char *dst, size_t size) {
             z->last_read = 0;
             z->read_eof = true;
             return 0;
+        }
         case MODE_STREAM:
         default: {
             int64_t r = zcio_read_full(z->stream, dst, size);
-            if (r < 0) { z->last_read = 0; return 0; }
+            if (r < 0) {
+                /* Real error, not clean EOF. Flag it so scalar/read_str callers
+                 * can distinguish from a graceful end-of-stream (which yields
+                 * last_read=0 with read_eof set by zcio_stream_eof below). */
+                z->last_read = 0;
+                z->short_read = true;
+                z->read_eof = true;
+                return 0;
+            }
             z->last_read = (size_t)r;
             if ((size_t)r != size) {
                 z->short_read = true;
@@ -237,15 +256,68 @@ void zcio_serial_write_str(zcio_serial *z, const char *s, size_t len) {
 }
 
 char *zcio_serial_read_str(zcio_serial *z, size_t *out_len) {
+    /* Hard cap for stream mode, where the declared length is attacker-controlled
+     * and the real available size is unknown until we read. 256 MiB. */
+    static const uint64_t STREAM_READ_CAP = 256ull * 1024 * 1024;
+
     uint64_t n = 0;
     if (zcio_serial_read_bytes(z, &n, sizeof n) != (int64_t)sizeof n) return NULL;
+
+    /* Reject lengths that would overflow `(size_t)n + 1` (the malloc size). */
+    if (n == UINT64_MAX || (uint64_t)(size_t)n != n || (size_t)n + 1 == 0) {
+        zcio_fail_(ZCIO_ERR_INVALID_ARG, "serial read_str length too large: %llu",
+                   (unsigned long long)n);
+        return NULL;
+    }
+
+    /* Cap n against what could actually be available so a bogus length can't
+     * trigger a huge allocation. */
+    switch (z->mode) {
+        case MODE_BUFFER:
+        case MODE_COUNT: {
+            int64_t total = zcio_serial_read_len(z);
+            int64_t pos   = zcio_serial_read_pos(z);
+            int64_t avail = (total > pos) ? total - pos : 0;
+            if (n > (uint64_t)avail) {
+                zcio_fail_(ZCIO_ERR_INVALID_ARG,
+                           "serial read_str length %llu exceeds %lld available",
+                           (unsigned long long)n, (long long)avail);
+                return NULL;
+            }
+            break;
+        }
+        case MODE_STREAM:
+        default:
+            if (n > STREAM_READ_CAP) {
+                zcio_fail_(ZCIO_ERR_INVALID_ARG,
+                           "serial read_str length %llu exceeds %llu cap",
+                           (unsigned long long)n, (unsigned long long)STREAM_READ_CAP);
+                return NULL;
+            }
+            break;
+    }
+
     char *out = (char *)malloc((size_t)n + 1);
-    if (!out) return NULL;
+    if (!out) {
+        zcio_fail_(ZCIO_ERR_NOMEM, "serial read_str: out of memory for %llu bytes",
+                   (unsigned long long)n);
+        return NULL;
+    }
+
+    size_t got = 0;
     if (n) {
         int64_t r = zcio_serial_read_bytes(z, out, (size_t)n);
-        if (r < (int64_t)n) { /* short read: still NUL-terminate what we got */ }
+        if (r < 0) { free(out); return NULL; }
+        got = (size_t)r;
+        if (got < (size_t)n) {
+            /* Short read: report only what we actually read; NUL-terminate at
+             * the real length so the tail is never uninitialized. */
+            out[got] = '\0';
+            if (out_len) *out_len = got;
+            return out;
+        }
     }
-    out[n] = '\0';
+    out[(size_t)n] = '\0';
     if (out_len) *out_len = (size_t)n;
     return out;
 }

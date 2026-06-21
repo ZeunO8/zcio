@@ -17,6 +17,7 @@ add_zcio_test(test_net             tests/c/test_net.c)
 add_zcio_test(test_util            tests/c/test_util.c)
 add_zcio_test(test_dns             tests/c/test_dns.c)
 add_zcio_test(test_archive         tests/c/test_archive.c)
+add_zcio_test(test_hardening       tests/c/test_hardening.c)
 
 # Tests that spin loopback servers in threads.
 if(NOT WIN32)

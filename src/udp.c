@@ -6,7 +6,10 @@
 #include "zcio/dns.h"
 #include "internal.h"
 
-#define UDP_RECV_BUF 4096
+/* Max IPv4 UDP payload (65535 - 8 UDP - 20 IP, but use the theoretical cap so a
+ * single recvfrom never silently truncates an in-spec datagram). On truncation
+ * the OS sets MSG_TRUNC and discards the excess; sizing to the max avoids it. */
+#define UDP_RECV_BUF 65535
 
 /* --------------------------- UDP client stream -------------------------- */
 /* A datagram stream bound to a single peer: write -> sendto, read -> recvfrom.
@@ -22,8 +25,16 @@ static int64_t udp_cli_read(void *c, void *dst, size_t n) {
     if (s->closed || s->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
     struct sockaddr_in from;
     socklen_t flen = sizeof from;
-    long long got = recvfrom(s->fd, (char *)dst, (int)n, 0,
-                             (struct sockaddr *)&from, &flen);
+    long long got;
+    do {
+        flen = sizeof from;
+        got = recvfrom(s->fd, (char *)dst, (int)n, 0,
+                       (struct sockaddr *)&from, &flen);
+    } while (got < 0
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (got > 0) return (int64_t)got;
     if (got == 0) return 0;
 #if defined(_WIN32)
@@ -37,7 +48,7 @@ static int64_t udp_cli_read(void *c, void *dst, size_t n) {
 static int64_t udp_cli_write(void *c, const void *src, size_t n) {
     udp_clictx *s = (udp_clictx *)c;
     if (s->closed || s->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
-    long long sent = sendto(s->fd, (const char *)src, (int)n, 0,
+    long long sent = sendto(s->fd, (const char *)src, (int)n, ZCIO_SEND_FLAGS,
                             (struct sockaddr *)&s->peer, sizeof s->peer);
     if (sent < 0) return ZCIO_ERR;
     return (int64_t)sent;
@@ -84,6 +95,7 @@ zcio_udp_client *zcio_udp_client_open(const char *host, int port) {
         zcio_fail_(ZCIO_ERR, "udp_client: socket() failed");
         return NULL;
     }
+    zcio_socket_nosigpipe(fd);
 
     udp_clictx *ctx = (udp_clictx *)zcio_xcalloc(1, sizeof *ctx);
     if (!ctx) {
@@ -141,7 +153,10 @@ typedef struct udp_pktctx {
 static int64_t udp_pkt_read(void *c, void *dst, size_t n) {
     udp_pktctx *p = (udp_pktctx *)c;
     size_t avail = p->buf_len - p->buf_pos;
-    if (avail == 0) return 0;             /* nothing buffered: EOF-for-now    */
+    /* Drained buffer is "try again later", not EOF: the datagram buffer is
+     * refilled out-of-band by zcio_udp_server_receive(). Returning 0 here would
+     * falsely signal end-of-stream (0 == EOF in the read contract). */
+    if (avail == 0) return ZCIO_ERR_WOULDBLOCK;
     size_t take = avail < n ? avail : n;
     memcpy(dst, p->buf + p->buf_pos, take);
     p->buf_pos += take;
@@ -151,7 +166,7 @@ static int64_t udp_pkt_read(void *c, void *dst, size_t n) {
 static int64_t udp_pkt_write(void *c, const void *src, size_t n) {
     udp_pktctx *p = (udp_pktctx *)c;
     if (p->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
-    long long sent = sendto(p->fd, (const char *)src, (int)n, 0,
+    long long sent = sendto(p->fd, (const char *)src, (int)n, ZCIO_SEND_FLAGS,
                             (struct sockaddr *)&p->peer, sizeof p->peer);
     if (sent < 0) return ZCIO_ERR;
     return (int64_t)sent;
@@ -201,6 +216,7 @@ zcio_udp_server *zcio_udp_server_bind(int port) {
         zcio_fail_(ZCIO_ERR, "udp_server: socket() failed");
         return NULL;
     }
+    zcio_socket_nosigpipe(fd);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
@@ -275,9 +291,11 @@ zcio_udp_server_receive(zcio_udp_server *s, bool non_block, unsigned timeout_us)
         DWORD to = timeout_us / 1000;
         setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof to);
 #else
+        /* Normalize: tv_usec must be < 1e6, so timeouts >= 1s split into
+         * whole seconds + remainder (otherwise setsockopt rejects them). */
         struct timeval to;
-        to.tv_sec = 0;
-        to.tv_usec = (int)timeout_us;
+        to.tv_sec  = (long)(timeout_us / 1000000u);
+        to.tv_usec = (long)(timeout_us % 1000000u);
         setsockopt(s->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof to);
 #endif
         s->rcvtimeo_us = timeout_us;
@@ -288,8 +306,16 @@ zcio_udp_server_receive(zcio_udp_server *s, bool non_block, unsigned timeout_us)
     struct sockaddr_in from;
     memset(&from, 0, sizeof from);
     socklen_t flen = sizeof from;
-    long long got = recvfrom(s->fd, buffer, sizeof buffer, 0,
-                             (struct sockaddr *)&from, &flen);
+    long long got;
+    do {
+        flen = sizeof from;
+        got = recvfrom(s->fd, buffer, sizeof buffer, 0,
+                       (struct sockaddr *)&from, &flen);
+    } while (got < 0
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (got <= 0) return NULL; /* timeout / error / empty */
 
     zcio_udp_packet *pk = server_peer(s, &from);

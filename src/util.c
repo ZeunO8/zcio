@@ -2,6 +2,7 @@
 #include "zcio/zcio.h"
 #include "internal.h"
 #include <stdarg.h>
+#include <stdatomic.h>
 
 /* Version is single-sourced from CMake (PROJECT_VERSION). The fallbacks keep a
  * non-CMake/IDE compile of this TU building. */
@@ -67,16 +68,31 @@ void zcio_free(void *p) { free(p); }
 /* --- library init ------------------------------------------------------- */
 extern void zcio_tls_install_default_backend(void); /* provided by tls backend TU */
 
-static bool g_inited = false;
+/* Thread-safe one-time init via an atomic state machine, replacing the racy
+ * check-then-set. States: 0 = uninit, 1 = in progress, 2 = done. The winner of
+ * the CAS runs the body; concurrent callers spin until it reaches DONE. */
+enum { ZCIO_INIT_NONE = 0, ZCIO_INIT_BUSY = 1, ZCIO_INIT_DONE = 2 };
+static _Atomic int g_init_state = ZCIO_INIT_NONE;
 
 void zcio_init(void) {
-    if (g_inited) return;
-    g_inited = true;
-    zcio_socket_startup();
-    zcio_tls_install_default_backend();
+    int expected = ZCIO_INIT_NONE;
+    if (atomic_compare_exchange_strong_explicit(
+            &g_init_state, &expected, ZCIO_INIT_BUSY,
+            memory_order_acq_rel, memory_order_acquire)) {
+        zcio_socket_startup();
+        zcio_tls_install_default_backend();
+        atomic_store_explicit(&g_init_state, ZCIO_INIT_DONE, memory_order_release);
+        return;
+    }
+    /* Lost the race (or already done): wait until the winner finishes. */
+    while (atomic_load_explicit(&g_init_state, memory_order_acquire) != ZCIO_INIT_DONE)
+        ; /* brief spin; init is fast and runs once per process */
 }
 
-void zcio_shutdown(void) { g_inited = false; }
+/* Init is idempotent and process-wide; there is no safe per-call teardown
+ * (socket_init owns WSACleanup on Windows), so shutdown is intentionally a
+ * no-op here. Left in place for API compatibility. */
+void zcio_shutdown(void) { }
 
 const char *zcio_version_string(void) { return ZCIO_VERSION_STR; }
 void zcio_version(int *maj, int *min, int *pat) {

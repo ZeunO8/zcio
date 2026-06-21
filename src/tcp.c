@@ -26,26 +26,14 @@ typedef struct sock_wait {
 } sock_wait;
 
 static sock_wait tcp_wait(zcio_socket fd, int timeout_ms, bool want_read, bool want_write) {
-    fd_set rs, ws, es;
-    FD_ZERO(&rs); FD_ZERO(&ws); FD_ZERO(&es);
-    if (want_read)  FD_SET(fd, &rs);
-    if (want_write) FD_SET(fd, &ws);
-    FD_SET(fd, &es);
-
-    struct timeval tv;
-    struct timeval *tvp = NULL;
-    if (timeout_ms >= 0) {
-        tv.tv_sec  = timeout_ms / 1000;
-        tv.tv_usec = (timeout_ms % 1000) * 1000;
-        tvp = &tv;
-    }
-    int res = select((int)(fd + 1), &rs, &ws, &es, tvp);
+    bool rd = false, wr = false;
+    int res = zcio_select_eintr(fd, want_read, want_write, &rd, &wr, timeout_ms);
     sock_wait out = {0};
     out.rc = res;
     if (res > 0) {
-        out.readable = FD_ISSET(fd, &rs) != 0;
-        out.writable = FD_ISSET(fd, &ws) != 0;
-        out.excepted = FD_ISSET(fd, &es) != 0;
+        out.readable = rd;
+        out.writable = wr;
+        out.excepted = false;
     }
     return out;
 }
@@ -66,7 +54,14 @@ static int64_t tcp_s_read(void *c, void *dst, size_t n) {
     if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
     if (!w.readable) return ZCIO_ERR_TIMEOUT;
 
-    long long got = recv(s->fd, (char *)dst, (int)n, 0);
+    long long got;
+    do {
+        got = recv(s->fd, (char *)dst, (int)n, 0);
+    } while (got < 0
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (got > 0) return (int64_t)got;
     if (got == 0) { s->eof = true; return 0; } /* peer closed */
 #if defined(_WIN32)
@@ -86,8 +81,32 @@ static int64_t tcp_s_write(void *c, const void *src, size_t n) {
     if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
     if (!w.writable) return ZCIO_ERR_TIMEOUT;
 
-    long long sent = send(s->fd, (const char *)src, (int)n, 0);
+    long long sent;
+    do {
+        sent = send(s->fd, (const char *)src, (int)n, ZCIO_SEND_FLAGS);
+    } while (sent < 0
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (sent > 0) return (int64_t)sent;
+    if (sent == 0) return 0; /* nothing sent this call; not a hard error */
+#if defined(_WIN32)
+    {
+        int werr = WSAGetLastError();
+        if (werr == WSAEWOULDBLOCK) return ZCIO_ERR_WOULDBLOCK;
+        if (werr == WSAECONNRESET || werr == WSAECONNABORTED) {
+            s->eof = true;
+            return ZCIO_ERR_EOF;
+        }
+    }
+#else
+    if (errno == EAGAIN || errno == EWOULDBLOCK) return ZCIO_ERR_WOULDBLOCK;
+    if (errno == EPIPE || errno == ECONNRESET) {
+        s->eof = true;
+        return ZCIO_ERR_EOF;
+    }
+#endif
     return ZCIO_ERR;
 }
 
@@ -168,6 +187,13 @@ static zcio_socket tcp_do_connect(const char *host, int port) {
         zcio_fail_(ZCIO_ERR_CONNECT, "tcp: socket() failed");
         return ZCIO_INVALID_SOCKET;
     }
+    zcio_socket_nosigpipe(fd);
+
+    /* Non-blocking BEFORE connect so the EINPROGRESS + 15s-select path below is
+     * live (a blocking socket would silently use the kernel default timeout).
+     * The socket is left non-blocking; per-op tcp_wait() governs read/write
+     * timeouts, consistent with tcp_s_read/tcp_s_write EWOULDBLOCK handling. */
+    zcio_set_nonblocking(fd, true);
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
@@ -333,6 +359,12 @@ struct zcio_tcp_server {
     conn_slot    *slots;       /* growable array indexed by id              */
     size_t        slots_len;   /* allocated length (== next_id high-water)  */
     size_t        slots_cap;
+    /* Free-list of reclaimed ids (slots whose conn was closed). accept()
+     * reuses these before bumping next_id, bounding slot-array growth so a
+     * churn of connect/close cannot grow memory without limit. */
+    size_t       *free_ids;
+    size_t        free_len;
+    size_t        free_cap;
 };
 
 static zcio_tcp_server *
@@ -343,6 +375,7 @@ tcp_server_make(int port, zcio_tls_ctx *ctx, bool non_blocking) {
         zcio_fail_(ZCIO_ERR, "tcp_server: socket() failed");
         return NULL;
     }
+    zcio_socket_nosigpipe(fd);
     if (zcio_set_nonblocking(fd, true) != ZCIO_OK) {
         zcio_closesocket(fd);
         zcio_fail_(ZCIO_ERR, "tcp_server: set non-blocking failed");
@@ -401,6 +434,7 @@ void zcio_tcp_server_free(zcio_tcp_server *s) {
         }
     }
     free(s->slots);
+    free(s->free_ids);
     if (s->listen_fd != ZCIO_INVALID_SOCKET) {
         shutdown(s->listen_fd, ZCIO_SHUT_WR);
         zcio_closesocket(s->listen_fd);
@@ -426,6 +460,13 @@ static int server_store(zcio_tcp_server *s, size_t id, zcio_tcp_conn *conn) {
     return ZCIO_OK;
 }
 
+/* Pop a reclaimed id if one is available; return true and write *out. */
+static bool server_pop_free_id(zcio_tcp_server *s, size_t *out) {
+    if (s->free_len == 0) return false;
+    *out = s->free_ids[--s->free_len];
+    return true;
+}
+
 zcio_tcp_conn *zcio_tcp_server_accept(zcio_tcp_server *s, size_t *out_id, int timeout_ms) {
     if (!s) { zcio_fail_(ZCIO_ERR_INVALID_ARG, "accept: NULL server"); return NULL; }
 
@@ -436,12 +477,22 @@ zcio_tcp_conn *zcio_tcp_server_accept(zcio_tcp_server *s, size_t *out_id, int ti
     struct sockaddr_in caddr;
     memset(&caddr, 0, sizeof caddr);
     socklen_t clen = sizeof caddr;
-    zcio_socket cfd = accept(s->listen_fd, (struct sockaddr *)&caddr, &clen);
+    zcio_socket cfd;
+    do {
+        clen = sizeof caddr;
+        cfd = accept(s->listen_fd, (struct sockaddr *)&caddr, &clen);
+    } while (cfd == ZCIO_INVALID_SOCKET
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (cfd == ZCIO_INVALID_SOCKET) return NULL;
+    zcio_socket_nosigpipe(cfd);
 
-    /* Accepted socket inherits non-blocking on some platforms; force blocking
-     * semantics off so our select()+recv loop governs timeouts. */
-    zcio_set_nonblocking(cfd, false);
+    /* Leave the accepted socket non-blocking; the per-op tcp_wait() select
+     * (EINTR-safe) governs read/write timeouts and tcp_s_read/tcp_s_write
+     * already handle EWOULDBLOCK. */
+    zcio_set_nonblocking(cfd, true);
 
     zcio_stream *plain = tcp_make_plain_stream(cfd);
     if (!plain) {
@@ -470,7 +521,8 @@ zcio_tcp_conn *zcio_tcp_server_accept(zcio_tcp_server *s, size_t *out_id, int ti
     conn->fd = cfd;
     conn->stream = use;
 
-    size_t id = s->next_id++;
+    size_t id;
+    if (!server_pop_free_id(s, &id)) id = s->next_id++;
     if (server_store(s, id, conn) != ZCIO_OK) {
         zcio_stream_free(use);
         free(conn);
@@ -481,6 +533,9 @@ zcio_tcp_conn *zcio_tcp_server_accept(zcio_tcp_server *s, size_t *out_id, int ti
     return conn;
 }
 
+/* Closes and frees the client identified by `id`. CONTRACT: after this call the
+ * zcio_tcp_conn* previously returned by accept() for this id is freed (dangling);
+ * the caller must not use it again. The id is recycled by a later accept(). */
 int zcio_tcp_server_close_client(zcio_tcp_server *s, size_t id) {
     if (!s) return ZCIO_ERR_INVALID_ARG;
     if (id >= s->slots_len || !s->slots[id].conn)
@@ -489,6 +544,15 @@ int zcio_tcp_server_close_client(zcio_tcp_server *s, size_t id) {
     zcio_stream_free(conn->stream);
     free(conn);
     s->slots[id].conn = NULL;
+
+    /* Reclaim the id for reuse. If the free-list push fails (OOM), simply drop
+     * the id: the slot stays NULL and next_id-allocated ids remain valid. */
+    if (s->free_len >= s->free_cap) {
+        size_t ncap = s->free_cap ? s->free_cap * 2 : 8;
+        size_t *nf = (size_t *)realloc(s->free_ids, ncap * sizeof *nf);
+        if (nf) { s->free_ids = nf; s->free_cap = ncap; }
+    }
+    if (s->free_len < s->free_cap) s->free_ids[s->free_len++] = id;
     return ZCIO_OK;
 }
 

@@ -18,10 +18,16 @@
 #include "internal.h"
 
 #include <ctype.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ZCIO_HTTP_MAX_REDIRECTS 5
+
+/* Hard cap on a single response (headers + body) to bound memory use against a
+ * hostile or runaway server. 64 MiB. */
+#define ZCIO_HTTP_MAX_RESPONSE ((size_t)64 * 1024 * 1024)
 
 /* ------------------------------ URL parsing ----------------------------- */
 
@@ -68,36 +74,77 @@ static int url_parse(const char *uri, zcio_url *out) {
     const char *p = colon + 1;
     if (p[0] == '/' && p[1] == '/') p += 2;
 
-    /* host[:port] runs up to the first '/'. */
+    /* authority runs up to the first '/' (or end). */
     const char *slash = strchr(p, '/');
-    size_t hostport_len = slash ? (size_t)(slash - p) : strlen(p);
+    const char *auth = p;
+    size_t auth_len = slash ? (size_t)(slash - p) : strlen(p);
 
     /* path. */
     const char *path_src = slash ? slash : "/";
     out->path = zcio_strdup_(path_src);
     if (!out->path) { url_free(out); return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory"); }
 
-    /* split host / port within hostport_len. */
-    const char *port_sep = NULL;
-    for (size_t i = 0; i < hostport_len; i++) {
-        if (p[i] == ':') { port_sep = p + i; break; }
+    /* Strip userinfo: "user:pass@host" -> skip past the last '@' in authority. */
+    {
+        const char *at = NULL;
+        for (size_t i = 0; i < auth_len; i++)
+            if (auth[i] == '@') at = auth + i;
+        if (at) {
+            size_t consumed = (size_t)(at + 1 - auth);
+            auth += consumed;
+            auth_len -= consumed;
+        }
     }
 
-    size_t host_len = port_sep ? (size_t)(port_sep - p) : hostport_len;
+    /* Split host[:port]. Handle IPv6 literal in brackets "[::1]" / "[::1]:8443". */
+    const char *host_begin;
+    size_t host_len;
+    const char *port_str = NULL;
+    size_t port_str_len = 0;
+
+    if (auth_len > 0 && auth[0] == '[') {
+        const char *rb = memchr(auth, ']', auth_len);
+        if (!rb) { url_free(out); return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: unterminated IPv6 literal in '%s'", uri); }
+        host_begin = auth + 1;
+        host_len = (size_t)(rb - host_begin);
+        const char *after = rb + 1;
+        size_t after_len = auth_len - (size_t)(after - auth);
+        if (after_len > 0) {
+            if (after[0] != ':') { url_free(out); return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: malformed authority in '%s'", uri); }
+            port_str = after + 1;
+            port_str_len = after_len - 1;
+        }
+    } else {
+        const char *port_sep = memchr(auth, ':', auth_len);
+        host_begin = auth;
+        host_len = port_sep ? (size_t)(port_sep - auth) : auth_len;
+        if (port_sep) {
+            port_str = port_sep + 1;
+            port_str_len = auth_len - (host_len + 1);
+        }
+    }
+
     out->host = (char *)zcio_xmalloc(host_len + 1);
     if (!out->host) { url_free(out); return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory"); }
-    memcpy(out->host, p, host_len);
+    memcpy(out->host, host_begin, host_len);
     out->host[host_len] = '\0';
 
-    if (port_sep) {
-        const char *port_str = port_sep + 1;
-        size_t port_str_len = hostport_len - (host_len + 1);
-        if (port_str_len == 0) {
-            out->port = out->secure ? 443 : 80;
-        } else {
-            out->port = atoi(port_str);   /* port_str points into uri, atoi stops at '/' */
-            if (out->port <= 0) out->port = out->secure ? 443 : 80;
+    if (port_str && port_str_len > 0) {
+        /* Parse and validate the port strictly: digits only, range 1..65535. */
+        char pbuf[16];
+        if (port_str_len >= sizeof pbuf) {
+            url_free(out);
+            return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: invalid port in '%s'", uri);
         }
+        memcpy(pbuf, port_str, port_str_len);
+        pbuf[port_str_len] = '\0';
+        char *end = NULL;
+        long port = strtol(pbuf, &end, 10);
+        if (end == pbuf || *end != '\0' || port < 1 || port > 65535) {
+            url_free(out);
+            return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: invalid port in '%s'", uri);
+        }
+        out->port = (int)port;
     } else {
         out->port = out->secure ? 443 : 80;
     }
@@ -114,9 +161,14 @@ typedef struct {
 } buf_t;
 
 static int buf_reserve(buf_t *b, size_t extra) {
-    if (b->len + extra <= b->cap) return ZCIO_OK;
+    if (extra > SIZE_MAX - b->len) return ZCIO_ERR_NOMEM; /* len+extra overflow */
+    size_t need = b->len + extra;
+    if (need <= b->cap) return ZCIO_OK;
     size_t cap = b->cap ? b->cap : 256;
-    while (cap < b->len + extra) cap *= 2;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) { cap = need; break; } /* doubling would overflow */
+        cap *= 2;
+    }
     char *nd = (char *)realloc(b->data, cap);
     if (!nd) return ZCIO_ERR_NOMEM;
     b->data = nd;
@@ -156,6 +208,16 @@ static int json_append_escaped(buf_t *b, const char *s) {
 
 /* ------------------------- request construction ------------------------- */
 
+/* Reject strings containing CR, LF, or other control chars (0x00-0x1F, 0x7F)
+ * that could be used for HTTP request/header injection. Returns true if safe. */
+static bool header_token_ok(const char *s) {
+    if (!s) return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < 0x20 || *p == 0x7f) return false;
+    }
+    return true;
+}
+
 /* Build "VERB PATH HTTP/1.1\r\nHost: ..\r\n<headers>\r\nContent-Length: n\r\n\r\n"
  * followed by the raw body, into *out. Returns ZCIO_OK or negated result. */
 static int build_request(buf_t *out, const char *method, const zcio_url *u,
@@ -163,6 +225,10 @@ static int build_request(buf_t *out, const char *method, const zcio_url *u,
                          const void *body, size_t body_len) {
     memset(out, 0, sizeof *out);
     char clbuf[32];
+
+    /* Guard against CRLF/header injection via a hostile method. */
+    if (!header_token_ok(method))
+        return zcio_fail_(ZCIO_ERR_INVALID_ARG, "http: illegal characters in method");
 
     if (buf_append_str(out, method) != ZCIO_OK) goto oom;
     if (buf_append_char(out, ' ') != ZCIO_OK) goto oom;
@@ -173,6 +239,9 @@ static int build_request(buf_t *out, const char *method, const zcio_url *u,
 
     for (size_t i = 0; i < header_count; i++) {
         if (!headers[i].key) continue;
+        /* Skip any header whose key or value carries injection characters. */
+        if (!header_token_ok(headers[i].key)) continue;
+        if (headers[i].value && !header_token_ok(headers[i].value)) continue;
         if (buf_append_str(out, headers[i].key) != ZCIO_OK) goto oom;
         if (buf_append_str(out, ": ") != ZCIO_OK) goto oom;
         if (buf_append_str(out, headers[i].value ? headers[i].value : "") != ZCIO_OK) goto oom;
@@ -206,6 +275,12 @@ static int read_all(zcio_stream *s, buf_t *out) {
             return zcio_fail_((zcio_result)r, "http: read failed");
         }
         if (r == 0) break; /* EOF */
+        if (out->len + (size_t)r > ZCIO_HTTP_MAX_RESPONSE) {
+            free(out->data);
+            memset(out, 0, sizeof *out);
+            return zcio_fail_(ZCIO_ERR_PROTOCOL,
+                              "http: response exceeds %zu byte limit", ZCIO_HTTP_MAX_RESPONSE);
+        }
         if (buf_append(out, chunk, (size_t)r) != ZCIO_OK) {
             free(out->data);
             memset(out, 0, sizeof *out);
@@ -406,18 +481,37 @@ oom:
 /* ------------------------- single request round ------------------------- */
 
 /* Perform one request/response exchange (no redirect handling). Fills *resp
- * and, when non-NULL, *location_out with a malloc'd redirect target. Returns
- * ZCIO_OK or a negated result (leaving *resp zeroed on error). */
+ * and, when non-NULL, *location_out with a malloc'd redirect target. When
+ * `prev` is non-NULL it receives a copy of the parsed URL of THIS request
+ * (caller owns and must url_free it) so a redirect can be resolved/validated
+ * against the request that produced it. Returns ZCIO_OK or a negated result
+ * (leaving *resp zeroed on error). */
 static int do_exchange(const char *method, const char *url,
                        const zcio_http_header *headers, size_t header_count,
                        const void *body, size_t body_len,
-                       zcio_http_response *resp, char **location_out) {
+                       zcio_http_response *resp, char **location_out,
+                       zcio_url *prev) {
     memset(resp, 0, sizeof *resp);
     if (location_out) *location_out = NULL;
 
     zcio_url u;
     int pr = url_parse(url, &u);
     if (pr != ZCIO_OK) return pr;
+
+    /* Hand the caller a copy of the parsed URL for redirect resolution. */
+    if (prev) {
+        memset(prev, 0, sizeof *prev);
+        prev->scheme = zcio_strdup_(u.scheme);
+        prev->secure = u.secure;
+        prev->host   = zcio_strdup_(u.host);
+        prev->port   = u.port;
+        prev->path   = zcio_strdup_(u.path);
+        if ((u.scheme && !prev->scheme) || (u.host && !prev->host) || (u.path && !prev->path)) {
+            url_free(prev);
+            url_free(&u);
+            return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory");
+        }
+    }
 
     /* Establish connection. */
     zcio_tls_ctx *tls = NULL;
@@ -475,6 +569,75 @@ static int do_exchange(const char *method, const char *url,
     return p;
 }
 
+/* ------------------------------ redirects ------------------------------- */
+
+/* Resolve a redirect Location against the URL that produced it (`prev`).
+ *
+ * Security: if the previous request was secure (https) we REFUSE to follow a
+ * target that downgrades to plaintext http. On refusal *out is left NULL and
+ * the function returns ZCIO_ERR_PROTOCOL so the caller stops and returns the
+ * 3xx response as-is rather than resending headers in cleartext.
+ *
+ * Supports:
+ *   - absolute "http(s)://..." targets (downgrade-checked),
+ *   - relative "/path" targets, resolved against prev's scheme/host/port.
+ * Returns ZCIO_OK with a malloc'd absolute URL in *out, or a negated result. */
+static int resolve_redirect(const zcio_url *prev, const char *location, char **out) {
+    *out = NULL;
+    if (!location || !*location) return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: empty Location");
+
+    /* Absolute URL? (has a scheme before any '/'). */
+    bool absolute = false;
+    {
+        const char *c = strchr(location, ':');
+        const char *s = strchr(location, '/');
+        if (c && (!s || c < s)) absolute = true;
+    }
+
+    if (absolute) {
+        /* Downgrade guard: https -> http is refused. */
+        if (prev && prev->secure) {
+            size_t n = strlen(location);
+            if (n >= 5 && (location[0]=='h'||location[0]=='H') &&
+                tolower((unsigned char)location[1])=='t' &&
+                tolower((unsigned char)location[2])=='t' &&
+                tolower((unsigned char)location[3])=='p' &&
+                (location[4]==':' /* "http:" exactly, not "https:" */)) {
+                return zcio_fail_(ZCIO_ERR_PROTOCOL,
+                                  "http: refusing https->http redirect downgrade");
+            }
+        }
+        *out = zcio_strdup_(location);
+        return *out ? ZCIO_OK : zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory");
+    }
+
+    /* Relative target: must be rooted ('/path'); resolve against prev. */
+    if (!prev || !prev->scheme || !prev->host)
+        return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: cannot resolve relative redirect");
+    if (location[0] != '/')
+        return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: unsupported relative redirect '%s'", location);
+
+    /* scheme://host[:port]path  (wrap IPv6 host in brackets if needed). */
+    bool v6 = strchr(prev->host, ':') != NULL;
+    int default_port = prev->secure ? 443 : 80;
+    char portbuf[16];
+    portbuf[0] = '\0';
+    if (prev->port != default_port)
+        snprintf(portbuf, sizeof portbuf, ":%d", prev->port);
+
+    size_t need = strlen(prev->scheme) + 3 /* :// */
+                + (v6 ? 2 : 0) + strlen(prev->host)
+                + strlen(portbuf) + strlen(location) + 1;
+    char *abs = (char *)zcio_xmalloc(need);
+    if (!abs) return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory");
+    snprintf(abs, need, "%s://%s%s%s%s%s",
+             prev->scheme,
+             v6 ? "[" : "", prev->host, v6 ? "]" : "",
+             portbuf, location);
+    *out = abs;
+    return ZCIO_OK;
+}
+
 /* ------------------------------- public API ----------------------------- */
 
 zcio_http_response zcio_http_request(const char *method, const char *url,
@@ -491,7 +654,9 @@ zcio_http_response zcio_http_request(const char *method, const char *url,
 
     for (int redirect = 0; redirect <= ZCIO_HTTP_MAX_REDIRECTS; redirect++) {
         char *location = NULL;
-        int r = do_exchange(method, current, headers, header_count, body, n, &resp, &location);
+        zcio_url prev;
+        int r = do_exchange(method, current, headers, header_count, body, n,
+                            &resp, &location, &prev);
         if (r != ZCIO_OK) {
             free(current);
             free(location);
@@ -503,13 +668,24 @@ zcio_http_response zcio_http_request(const char *method, const char *url,
         /* Follow 3xx with a Location header. */
         bool is_redirect = (resp.status >= 300 && resp.status < 400);
         if (is_redirect && location && location[0] && redirect < ZCIO_HTTP_MAX_REDIRECTS) {
+            char *next = NULL;
+            int rr = resolve_redirect(&prev, location, &next);
+            free(location);
+            url_free(&prev);
+            if (rr != ZCIO_OK || !next) {
+                /* Refused (e.g. downgrade) or unresolvable: return the 3xx
+                 * response as-is rather than resending in cleartext. */
+                free(next);
+                break;
+            }
             free(current);
-            current = location;          /* take ownership */
+            current = next;              /* take ownership */
             zcio_http_response_free(&resp);
             memset(&resp, 0, sizeof resp);
             continue;
         }
         free(location);
+        url_free(&prev);
         break;
     }
 

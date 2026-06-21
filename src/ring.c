@@ -3,7 +3,15 @@
  * Layout when attached to external memory: [_Atomic size_t head]
  * [_Atomic size_t tail][data ...]. head is the producer cursor, tail the
  * consumer cursor; one slot is kept empty to distinguish full from empty.
- * All hot-path ops are O(1): index arithmetic + at most two memcpys. */
+ * All hot-path ops are O(1): index arithmetic + at most two memcpys.
+ *
+ * SPSC memory-order contract (explicit, do not change the algorithm):
+ *   - The producer owns `head`: it reads its own head relaxed, publishes head
+ *     with memory_order_release, and reads the consumer's `tail` with acquire.
+ *   - The consumer owns `tail`: it reads its own tail relaxed, publishes tail
+ *     with memory_order_release, and reads the producer's `head` with acquire.
+ * The release/acquire pairing ensures data written into the buffer happens-
+ * before the matching cursor advance is observed by the other thread. */
 #include "zcio/ring.h"
 #include "internal.h"
 #include <stdatomic.h>
@@ -39,12 +47,15 @@ static zcio_ring *ring_init(void *mem, size_t total, bool own, bool nb) {
     r->data = (char *)mem + sizeof(ring_header);
     r->capacity = total - sizeof(ring_header);
     r->non_blocking = nb;
-    atomic_store(&r->hdr->head, 0);
-    atomic_store(&r->hdr->tail, 0);
+    /* Single-threaded setup before either side runs; release is sufficient. */
+    atomic_store_explicit(&r->hdr->head, 0, memory_order_release);
+    atomic_store_explicit(&r->hdr->tail, 0, memory_order_release);
     return r;
 }
 
 zcio_ring *zcio_ring_new(size_t capacity, bool non_blocking) {
+    /* guard the `capacity + sizeof(ring_header) + 1` sum against wraparound */
+    if (capacity > SIZE_MAX - sizeof(ring_header) - 1) return NULL;
     size_t total = capacity + sizeof(ring_header) + 1; /* +1 reserved slot */
     void *mem = zcio_xmalloc(total);
     if (!mem) return NULL;
@@ -64,15 +75,19 @@ void zcio_ring_free(zcio_ring *r) {
     free(r);
 }
 
+/* Consumer-side query: head is the other thread's cursor (acquire), tail is
+ * our own (acquire is safe; relaxed would also do for a pure SPSC consumer). */
 size_t zcio_ring_available_read(const zcio_ring *r) {
-    size_t h = atomic_load(&r->hdr->head);
-    size_t t = atomic_load(&r->hdr->tail);
+    size_t h = atomic_load_explicit(&r->hdr->head, memory_order_acquire);
+    size_t t = atomic_load_explicit(&r->hdr->tail, memory_order_acquire);
     return (h + r->capacity - t) % r->capacity;
 }
 
+/* Producer-side query: tail is the other thread's cursor (acquire), head is
+ * our own (acquire is safe; relaxed would also do for a pure SPSC producer). */
 size_t zcio_ring_available_write(const zcio_ring *r) {
-    size_t h = atomic_load(&r->hdr->head);
-    size_t t = atomic_load(&r->hdr->tail);
+    size_t h = atomic_load_explicit(&r->hdr->head, memory_order_acquire);
+    size_t t = atomic_load_explicit(&r->hdr->tail, memory_order_acquire);
     return (r->capacity - 1 + t - h) % r->capacity;
 }
 
@@ -92,11 +107,13 @@ int64_t zcio_ring_write(zcio_ring *r, const void *src, size_t n) {
             continue;
         }
         size_t chunk = avail < (n - written) ? avail : (n - written);
-        size_t h = atomic_load(&r->hdr->head);
+        /* producer owns head: read it relaxed */
+        size_t h = atomic_load_explicit(&r->hdr->head, memory_order_relaxed);
         size_t end = (chunk < r->capacity - h) ? chunk : (r->capacity - h);
         memcpy(r->data + h, s + written, end);
         if (chunk > end) memcpy(r->data, s + written + end, chunk - end);
-        atomic_store(&r->hdr->head, (h + chunk) % r->capacity);
+        /* publish head with release so the bytes above are visible first */
+        atomic_store_explicit(&r->hdr->head, (h + chunk) % r->capacity, memory_order_release);
         written += chunk;
     }
     return (int64_t)written;
@@ -118,11 +135,13 @@ int64_t zcio_ring_read(zcio_ring *r, void *dst, size_t n) {
             continue;
         }
         size_t chunk = avail < (n - got) ? avail : (n - got);
-        size_t t = atomic_load(&r->hdr->tail);
+        /* consumer owns tail: read it relaxed */
+        size_t t = atomic_load_explicit(&r->hdr->tail, memory_order_relaxed);
         size_t end = (chunk < r->capacity - t) ? chunk : (r->capacity - t);
         memcpy(d + got, r->data + t, end);
         if (chunk > end) memcpy(d + got + end, r->data, chunk - end);
-        atomic_store(&r->hdr->tail, (t + chunk) % r->capacity);
+        /* publish tail with release so the freed slots are visible to producer */
+        atomic_store_explicit(&r->hdr->tail, (t + chunk) % r->capacity, memory_order_release);
         got += chunk;
     }
     return (int64_t)got;

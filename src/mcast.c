@@ -18,7 +18,7 @@ typedef struct mcast_sctx {
 static int64_t mcast_send_write(void *c, const void *src, size_t n) {
     mcast_sctx *s = (mcast_sctx *)c;
     if (s->closed || s->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
-    long long sent = sendto(s->fd, (const char *)src, (int)n, 0,
+    long long sent = sendto(s->fd, (const char *)src, (int)n, ZCIO_SEND_FLAGS,
                             (struct sockaddr *)&s->group, sizeof s->group);
     if (sent < 0) return ZCIO_ERR;
     return (int64_t)sent;
@@ -64,6 +64,7 @@ zcio_mcast_sender *zcio_mcast_sender_open(const char *group, int port) {
         zcio_fail_(ZCIO_ERR, "mcast_sender: socket() failed");
         return NULL;
     }
+    zcio_socket_nosigpipe(fd);
 
     int reuse = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&reuse, sizeof reuse);
@@ -121,8 +122,16 @@ static int64_t mcast_recv_read(void *c, void *dst, size_t n) {
     if (r->closed || r->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
     struct sockaddr_in from;
     socklen_t flen = sizeof from;
-    long long got = recvfrom(r->fd, (char *)dst, (int)n, 0,
-                             (struct sockaddr *)&from, &flen);
+    long long got;
+    do {
+        flen = sizeof from;
+        got = recvfrom(r->fd, (char *)dst, (int)n, 0,
+                       (struct sockaddr *)&from, &flen);
+    } while (got < 0
+#if !defined(_WIN32)
+             && errno == EINTR
+#endif
+            );
     if (got > 0) return (int64_t)got;
     if (got == 0) return 0;
 #if defined(_WIN32)
@@ -173,6 +182,7 @@ zcio_mcast_receiver *zcio_mcast_receiver_open(const char *group, int port) {
         zcio_fail_(ZCIO_ERR, "mcast_receiver: socket() failed");
         return NULL;
     }
+    zcio_socket_nosigpipe(fd);
     zcio_set_nonblocking(fd, true);
 
     int reuse = 1;
@@ -195,7 +205,11 @@ zcio_mcast_receiver *zcio_mcast_receiver_open(const char *group, int port) {
 
     struct ip_mreq mreq;
     memset(&mreq, 0, sizeof mreq);
-    mreq.imr_multiaddr.s_addr = inet_addr(ip);
+    if (inet_pton(AF_INET, ip, &mreq.imr_multiaddr) <= 0) {
+        zcio_closesocket(fd); free(ip);
+        zcio_fail_(ZCIO_ERR_INVALID_ARG, "mcast_receiver: invalid group address");
+        return NULL;
+    }
     mreq.imr_interface.s_addr = htonl(INADDR_ANY);
     free(ip);
     if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,

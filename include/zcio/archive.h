@@ -14,7 +14,7 @@ extern "C" {
 
 typedef struct zcio_archive zcio_archive;
 
-typedef enum zcio_archive_mode : int32_t {
+typedef ZCIO_ENUM(zcio_archive_mode, int32_t) {
     ZCIO_ARCHIVE_READ  = 0,
     ZCIO_ARCHIVE_WRITE = 1,
 } zcio_archive_mode;

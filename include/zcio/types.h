@@ -5,14 +5,26 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#if defined(__cplusplus)
-#  include <cstdbool>
-#else
+/* `bool` is a keyword in C++ and in C23; <stdbool.h> provides it on older C.
+ * Never include the deprecated/removed <cstdbool> for C++. */
+#if !defined(__cplusplus)
 #  include <stdbool.h>
 #endif
 
-/* --- export / linkage --------------------------------------------------- */
-#if defined(_WIN32) && defined(ZCIO_BUILD_SHARED)
+/* Enum with a fixed underlying type: standard in C++11 and C23, but not C11.
+ * The fixed width pins these enums to a stable ABI size; on pre-C23 C we fall
+ * back to a plain enum (all enumerators fit in int, so the size matches). */
+#if defined(__cplusplus) || (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L)
+#  define ZCIO_ENUM(NAME, TYPE) enum NAME : TYPE
+#else
+#  define ZCIO_ENUM(NAME, TYPE) enum NAME
+#endif
+
+/* --- export / linkage --------------------------------------------------- *
+ * For a shared build, consumers must see ZCIO_SHARED to get dllimport on
+ * Windows. The install/export interface defines ZCIO_SHARED; ZCIO_BUILDING is
+ * set only while compiling the library itself (-> dllexport). */
+#if defined(_WIN32) && (defined(ZCIO_SHARED) || defined(ZCIO_BUILD_SHARED))
 #  if defined(ZCIO_BUILDING)
 #    define ZCIO_API __declspec(dllexport)
 #  else
@@ -46,7 +58,7 @@ extern "C" {
 /* --- result codes ------------------------------------------------------- *
  * Mirrors (and extends) the original iostreams io_result_t so existing C
  * consumers port cleanly. Negative == error, 0 == success. */
-typedef enum zcio_result : int32_t {
+typedef ZCIO_ENUM(zcio_result, int32_t) {
     ZCIO_OK                 =  0,
     ZCIO_ERR                = -1,  /* generic / unspecified failure          */
     ZCIO_ERR_INVALID_ARG    = -2,  /* a NULL or out-of-range argument        */
@@ -63,14 +75,14 @@ typedef enum zcio_result : int32_t {
 } zcio_result;
 
 /* seek "which" mask -- read side, write side, or both. */
-typedef enum zcio_seek_which : uint32_t {
+typedef ZCIO_ENUM(zcio_seek_which, uint32_t) {
     ZCIO_SEEK_READ  = 1u << 0,
     ZCIO_SEEK_WRITE = 1u << 1,
     ZCIO_SEEK_BOTH  = ZCIO_SEEK_READ | ZCIO_SEEK_WRITE,
 } zcio_seek_which;
 
 /* seek origin -- matches stdio SEEK_SET/CUR/END ordering. */
-typedef enum zcio_seek_origin : int32_t {
+typedef ZCIO_ENUM(zcio_seek_origin, int32_t) {
     ZCIO_SEEK_SET = 0,
     ZCIO_SEEK_CUR = 1,
     ZCIO_SEEK_END = 2,
