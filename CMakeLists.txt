@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zcio
-    VERSION 0.9.0.0
+    VERSION 0.9.1.0
     DESCRIPTION "Pure C23 streaming I/O library (C rewrite of iostreams)"
     LANGUAGES C)
 
