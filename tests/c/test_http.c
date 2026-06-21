@@ -3,9 +3,8 @@
  * HTTP/1.1 200 response, then closes the connection so the client sees EOF. */
 #include "ztest.h"
 #include "zcio/zcio.h"
+#include "zthread.h"
 #include "internal_port.h"
-#include <pthread.h>
-#include <unistd.h>
 #include <stdio.h>
 
 typedef struct { int port; int ready; int requests; } srv_arg;
@@ -33,7 +32,7 @@ static void *http_server(void *p) {
         zcio_write_full(s, kResponse, strlen(kResponse));
         zcio_tcp_server_close_client(srv, id);     /* signal EOF to the client */
     }
-    usleep(50 * 1000);
+    zthread_sleep_ms(50);
     zcio_tcp_server_free(srv);
     return NULL;
 }
@@ -49,10 +48,10 @@ static void check_ok(zcio_http_response *r) {
 ZTEST(http_all_verbs_loopback) {
     zcio_init();
     srv_arg arg = { .port = ztest_free_port(), .ready = 0, .requests = 5 };
-    pthread_t th;
-    pthread_create(&th, NULL, http_server, &arg);
-    while (arg.ready == 0) usleep(2 * 1000);
-    if (arg.ready < 0) { pthread_join(th, NULL); ZCHECK(0); return; }
+    zthread_t th;
+    zthread_start(&th, http_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
 
     char url[64];
     snprintf(url, sizeof url, "http://127.0.0.1:%d/", arg.port);
@@ -65,7 +64,7 @@ ZTEST(http_all_verbs_loopback) {
     zcio_http_response q = zcio_http_request("PATCH", url, &hdr, 1, "z", 1);
     check_ok(&q);
 
-    pthread_join(th, NULL);
+    zthread_join(th);
 }
 
 ZTEST(http_get_bad_host) {

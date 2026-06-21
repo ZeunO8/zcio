@@ -3,7 +3,7 @@
  * fail) when the host has no usable multicast loopback route. */
 #include "ztest.h"
 #include "zcio/zcio.h"
-#include <unistd.h>
+#include "zthread.h"
 
 #define MC_GROUP "239.255.13.37"
 #define MC_PORT  39945
@@ -30,7 +30,7 @@ ZTEST(mcast_open_stream_free) {
             char buf[32] = {0};
             int64_t got = zcio_read(rs, buf, sizeof buf);
             if (got >= 11 && memcmp(buf, msg, 11) == 0) delivered = 1;
-            else usleep(5 * 1000);
+            else zthread_sleep_ms(5);
         }
     }
     if (!delivered)

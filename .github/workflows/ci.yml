@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # Full suite (C tests + C++/Python/Node bindings) with the OpenSSL backend.
+  posix:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Install OpenSSL (macOS)
+        if: runner.os == 'macOS'
+        run: brew install openssl@3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Configure
+        run: cmake -S . -B build -DZCIO_BUILD_SHARED=ON -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test (incl. bindings)
+        run: ctest --test-dir build --output-on-failure
+
+  # Sanitized run (ASan + UBSan) of the C suite to catch memory/UB regressions.
+  sanitizers:
+    name: ubuntu-asan-ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      - name: Configure (sanitized, bindings off)
+        run: cmake -S . -B build -DZCIO_SANITIZE=address,undefined -DZCIO_BUILD_BINDING_TESTS=OFF -DCMAKE_BUILD_TYPE=Debug
+      - run: cmake --build build --parallel
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Windows: validate the core + networking build and C tests with TLS compiled
+  # out (avoids OpenSSL provisioning friction); binding tests are POSIX-driven.
+  windows:
+    name: windows-latest
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure (TLS=none)
+        run: cmake -S . -B build -DZCIO_TLS=none -DZCIO_BUILD_BINDING_TESTS=OFF
+      - name: Build
+        run: cmake --build build --config Debug --parallel
+      - name: Test
+        run: ctest --test-dir build --build-config Debug --output-on-failure

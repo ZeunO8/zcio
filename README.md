@@ -73,6 +73,30 @@ test compiles its native addon on demand via `node-gyp`.
 
 To build with no TLS dependency at all: `-DZCIO_TLS=none`.
 
+### Install & consume
+
+```sh
+cmake --install build --prefix /usr/local
+```
+
+This installs the library, headers, a `pkg-config` file, and a CMake package
+config so downstream projects can consume zcio either way:
+
+```cmake
+find_package(zcio CONFIG REQUIRED)
+target_link_libraries(myapp PRIVATE zcio::zcio)
+```
+```sh
+cc myapp.c $(pkg-config --cflags --libs zcio) -o myapp
+```
+
+### Sanitizers
+
+```sh
+cmake -S . -B build-asan -DZCIO_SANITIZE=address,undefined -DZCIO_BUILD_BINDING_TESTS=OFF
+cmake --build build-asan && ctest --test-dir build-asan --output-on-failure
+```
+
 ## Example (C)
 
 ```c
@@ -118,3 +142,7 @@ custom-BIO-over-stream handshake plus the backend registry and cert/key loading.
 All three language bindings ship their own test suites at parity with the C API
 surface (Python 26 cases, Node, C++), each validated end-to-end through the C
 ABI including TCP/UDP/multicast/HTTP/TLS.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

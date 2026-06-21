@@ -1,0 +1,14 @@
+# Baseline static-analysis checks for zcio. compile_commands.json is emitted by
+# the CMake build (CMAKE_EXPORT_COMPILE_COMMANDS=ON), so:  clang-tidy -p build src/*.c
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  readability-non-const-parameter,
+  -bugprone-easily-swappable-parameters,
+  -cert-err33-c,
+  -clang-analyzer-security.insecureAPI.strcpy
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/zcio/.*\.h$'

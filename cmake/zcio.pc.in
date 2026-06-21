@@ -1,10 +1,11 @@
 prefix=@CMAKE_INSTALL_PREFIX@
 exec_prefix=${prefix}
-libdir=${exec_prefix}/lib
-includedir=${prefix}/include
+libdir=@CMAKE_INSTALL_FULL_LIBDIR@
+includedir=@CMAKE_INSTALL_FULL_INCLUDEDIR@
 
 Name: zcio
 Description: @CMAKE_PROJECT_DESCRIPTION@
 Version: @PROJECT_VERSION@
+Requires.private: @ZCIO_PC_REQUIRES_PRIVATE@
 Libs: -L${libdir} -lzcio
 Cflags: -I${includedir}

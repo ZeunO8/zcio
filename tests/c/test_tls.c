@@ -3,8 +3,7 @@
  * directions. Skips cleanly when no TLS backend is compiled in. */
 #include "ztest.h"
 #include "zcio/zcio.h"
-#include <pthread.h>
-#include <unistd.h>
+#include "zthread.h"
 
 #define TLS_PORT 39931
 
@@ -46,11 +45,11 @@ ZTEST(tls_loopback_roundtrip) {
     if (!srv) { zcio_tls_ctx_free(sctx); return; }
 
     server_arg arg = { .srv = srv, .ok = -1 };
-    pthread_t th;
-    pthread_create(&th, NULL, server_thread, &arg);
+    zthread_t th;
+    zthread_start(&th, server_thread, &arg);
 
     /* tiny grace so accept() is waiting before we connect */
-    usleep(50 * 1000);
+    zthread_sleep_ms(50);
 
     zcio_tls_ctx *cctx = zcio_tls_client_ctx("localhost");
     zcio_tcp_client *cli = zcio_tcp_client_connect_tls("127.0.0.1", TLS_PORT, cctx, false);
@@ -68,7 +67,7 @@ ZTEST(tls_loopback_roundtrip) {
         zcio_tcp_client_free(cli);
     }
 
-    pthread_join(th, NULL);
+    zthread_join(th);
     ZCHECK_EQ(arg.ok, 1);
 
     zcio_tcp_server_free(srv);

@@ -19,18 +19,18 @@ add_zcio_test(test_dns             tests/c/test_dns.c)
 add_zcio_test(test_archive         tests/c/test_archive.c)
 add_zcio_test(test_hardening       tests/c/test_hardening.c)
 
-# Tests that spin loopback servers in threads.
-if(NOT WIN32)
-    find_package(Threads REQUIRED)
-    add_zcio_test(test_tls          tests/c/test_tls.c)
-    add_zcio_test(test_tls_more     tests/c/test_tls_more.c)
-    add_zcio_test(test_http         tests/c/test_http.c)
-    add_zcio_test(test_net_advanced tests/c/test_net_advanced.c)
-    add_zcio_test(test_mcast        tests/c/test_mcast.c)
-    target_link_libraries(test_tls          PRIVATE Threads::Threads)
-    target_link_libraries(test_http         PRIVATE Threads::Threads)
-    target_link_libraries(test_net_advanced PRIVATE Threads::Threads)
-endif()
+# Networking/loopback tests. These now use the portable tests/c/zthread.h shim
+# (pthreads on POSIX, Win32 threads on Windows), so they build on all platforms.
+find_package(Threads REQUIRED)
+add_zcio_test(test_tls          tests/c/test_tls.c)
+add_zcio_test(test_tls_more     tests/c/test_tls_more.c)
+add_zcio_test(test_http         tests/c/test_http.c)
+add_zcio_test(test_net_advanced tests/c/test_net_advanced.c)
+add_zcio_test(test_mcast        tests/c/test_mcast.c)
+# Link the system threads lib where the shim uses pthreads (no-op on Windows).
+foreach(t test_tls test_http test_mcast)
+    target_link_libraries(${t} PRIVATE Threads::Threads)
+endforeach()
 
 # ---------------------------------------------------------------------------
 # Language-binding tests (C++ / Python / Node) run as part of the same suite.

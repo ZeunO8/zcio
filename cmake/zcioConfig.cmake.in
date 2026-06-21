@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+# zcio package config. Re-finds public dependencies so downstream linking works,
+# then pulls in the exported targets.
+include(CMakeFindDependencyMacro)
+
+set(ZCIO_TLS_BACKEND "@ZCIO_TLS@")
+if(ZCIO_TLS_BACKEND STREQUAL "openssl")
+    find_dependency(OpenSSL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/zcioTargets.cmake")
+
+check_required_components(zcio)

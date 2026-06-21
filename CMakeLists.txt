@@ -15,6 +15,7 @@ set_property(CACHE ZCIO_TLS PROPERTY STRINGS openssl none)
 option(ZCIO_WITH_ARCHIVE "Build libarchive-backed archive support" OFF)
 option(ZCIO_BUILD_TESTS   "Build the C test suite"                  ON)
 option(ZCIO_BUILD_SHARED  "Build a shared library too"              OFF)
+set(ZCIO_SANITIZE "" CACHE STRING "Sanitizers as a comma list, e.g. address,undefined,thread")
 
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -22,6 +23,14 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# Sanitizers apply globally (library + tests) so ctest exercises instrumented
+# code. Compile and link must both carry the flag.
+if(ZCIO_SANITIZE AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-fsanitize=${ZCIO_SANITIZE} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${ZCIO_SANITIZE})
+    message(STATUS "zcio sanitizers: ${ZCIO_SANITIZE}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -58,7 +67,13 @@ set(ZCIO_LIBS zcio)
 
 if(ZCIO_BUILD_SHARED)
     add_library(zcio_shared SHARED ${ZCIO_SOURCES})
-    set_target_properties(zcio_shared PROPERTIES OUTPUT_NAME zcio)
+    set_target_properties(zcio_shared PROPERTIES
+        OUTPUT_NAME zcio
+        VERSION   ${PROJECT_VERSION}          # full lib version on the file
+        SOVERSION ${PROJECT_VERSION_MAJOR})   # ABI version = MAJOR (SONAME)
+    # Consumers of the shared lib must see ZCIO_SHARED so the header emits
+    # dllimport on Windows; exported through the INSTALL/BUILD interface.
+    target_compile_definitions(zcio_shared INTERFACE ZCIO_SHARED)
     list(APPEND ZCIO_LIBS zcio_shared)
 endif()
 
@@ -121,8 +136,51 @@ endif()
 # ---------------------------------------------------------------------------
 # pkg-config
 # ---------------------------------------------------------------------------
+include(GNUInstallDirs)
+if(ZCIO_TLS STREQUAL "openssl")
+    set(ZCIO_PC_REQUIRES_PRIVATE "openssl")
+else()
+    set(ZCIO_PC_REQUIRES_PRIVATE "")
+endif()
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/zcio.pc.in
                ${CMAKE_CURRENT_BINARY_DIR}/zcio.pc @ONLY)
+
+# ---------------------------------------------------------------------------
+# Install + export (enables find_package(zcio) and pkg-config consumption)
+# ---------------------------------------------------------------------------
+include(CMakePackageConfigHelpers)
+
+install(TARGETS ${ZCIO_LIBS}
+        EXPORT zcioTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/zcio
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT zcioTargets
+        NAMESPACE zcio::
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcio
+        FILE zcioTargets.cmake)
+
+configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/zcioConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/zcioConfig.cmake
+        INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcio)
+
+write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/zcioConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMajorVersion)
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/zcioConfig.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/zcioConfigVersion.cmake
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/zcio)
+
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/zcio.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 
 # ---------------------------------------------------------------------------
 # Tests
