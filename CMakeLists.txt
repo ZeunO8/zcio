@@ -1,0 +1,129 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(zcio
+    VERSION 0.8.1.0
+    DESCRIPTION "Pure C23 streaming I/O library (C rewrite of iostreams)"
+    LANGUAGES C)
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+set(ZCIO_TLS "openssl" CACHE STRING "TLS backend: openssl | none")
+set_property(CACHE ZCIO_TLS PROPERTY STRINGS openssl none)
+# Off by default: the archive backend FetchContent-clones a non-canonical
+# libarchive fork. Opt in explicitly with -DZCIO_WITH_ARCHIVE=ON.
+option(ZCIO_WITH_ARCHIVE "Build libarchive-backed archive support" OFF)
+option(ZCIO_BUILD_TESTS   "Build the C test suite"                  ON)
+option(ZCIO_BUILD_SHARED  "Build a shared library too"              OFF)
+
+set(CMAKE_C_STANDARD 23)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# ---------------------------------------------------------------------------
+# Source set
+# ---------------------------------------------------------------------------
+set(ZCIO_SOURCES
+    src/util.c
+    src/socket_init.c
+    src/stream.c
+    src/serial.c
+    src/ring.c
+    src/membuf.c
+    src/dns.c
+    src/tcp.c
+    src/udp.c
+    src/mcast.c
+    src/tls.c
+    src/http.c
+    src/archive.c)
+
+# TLS backend selection: exactly one backend TU defines
+# zcio_tls_install_default_backend().
+if(ZCIO_TLS STREQUAL "openssl")
+    list(APPEND ZCIO_SOURCES src/tls_openssl.c)
+else()
+    list(APPEND ZCIO_SOURCES src/tls_none.c)
+endif()
+
+# Build a static lib, plus optionally a shared one. All per-target settings are
+# applied to every entry in ZCIO_LIBS so the two stay in lockstep.
+add_library(zcio STATIC ${ZCIO_SOURCES})
+add_library(zcio::zcio ALIAS zcio)
+set(ZCIO_LIBS zcio)
+
+if(ZCIO_BUILD_SHARED)
+    add_library(zcio_shared SHARED ${ZCIO_SOURCES})
+    set_target_properties(zcio_shared PROPERTIES OUTPUT_NAME zcio)
+    list(APPEND ZCIO_LIBS zcio_shared)
+endif()
+
+# Resolve optional backends once.
+if(ZCIO_TLS STREQUAL "openssl")
+    find_package(OpenSSL REQUIRED)
+    message(STATUS "zcio TLS backend: OpenSSL")
+else()
+    message(STATUS "zcio TLS backend: none (TLS compiled out)")
+endif()
+
+if(ZCIO_WITH_ARCHIVE)
+    include(FetchContent)
+    set(ENABLE_TEST OFF CACHE BOOL "" FORCE)
+    set(ENABLE_WERROR OFF CACHE BOOL "" FORCE)
+    set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+    message(STATUS "zcio: FetchContent libarchive")
+    FetchContent_Declare(libarchive
+        GIT_REPOSITORY https://github.com/ZeunO8/libarchive.git
+        GIT_TAG master)
+    FetchContent_MakeAvailable(libarchive)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(archive_static PRIVATE
+            -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers)
+    endif()
+endif()
+
+foreach(lib IN LISTS ZCIO_LIBS)
+    target_include_directories(${lib} PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>)
+    target_compile_definitions(${lib} PRIVATE ZCIO_BUILDING)
+    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(${lib} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
+    if(ZCIO_TLS STREQUAL "openssl")
+        target_link_libraries(${lib} PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(${lib} PRIVATE ZCIO_TLS_OPENSSL)
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+            target_compile_options(${lib} PRIVATE -Wno-deprecated-declarations)
+        endif()
+    endif()
+    if(ZCIO_WITH_ARCHIVE)
+        target_include_directories(${lib} PRIVATE ${libarchive_SOURCE_DIR}/libarchive)
+        target_link_libraries(${lib} PRIVATE archive_static)
+        target_compile_definitions(${lib} PRIVATE ZCIO_WITH_ARCHIVE)
+    endif()
+    if(WIN32)
+        target_link_libraries(${lib} PUBLIC ws2_32)
+    endif()
+endforeach()
+if(ZCIO_BUILD_SHARED)
+    target_compile_definitions(zcio_shared PRIVATE ZCIO_BUILD_SHARED)
+endif()
+
+# ---------------------------------------------------------------------------
+# pkg-config
+# ---------------------------------------------------------------------------
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/zcio.pc.in
+               ${CMAKE_CURRENT_BINARY_DIR}/zcio.pc @ONLY)
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+if(ZCIO_BUILD_TESTS)
+    enable_testing()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/tests/Tests.cmake)
+endif()

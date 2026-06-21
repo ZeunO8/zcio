@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zcio"
+version = "0.1.0"
+description = "Python ctypes binding for the zcio C streaming I/O library"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+
+[tool.setuptools]
+packages = ["zcio"]
+
+# The compiled zcio shared library is a runtime dependency located via the
+# ZCIO_LIBRARY env var or a sibling build/ directory. It is not bundled here;
+# build it with CMake (-DZCIO_BUILD_SHARED=ON).

@@ -1,0 +1,15 @@
+build*/
+*.o
+*.a
+*.dylib
+*.so
+*.dll
+.DS_Store
+# node binding artifacts
+bindings/node/build/
+bindings/node/node_modules/
+# python
+__pycache__/
+*.pyc
+bindings/python/*.egg-info/
+.cache/

@@ -1,0 +1,12 @@
+{
+  "name": "zcio",
+  "version": "0.1.0",
+  "description": "Node.js N-API bindings for the zcio streaming I/O C library",
+  "main": "index.js",
+  "gypfile": true,
+  "scripts": {
+    "build": "node-gyp rebuild",
+    "test": "node test/test.js"
+  },
+  "license": "MIT"
+}
