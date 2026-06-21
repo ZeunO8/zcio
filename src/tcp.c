@@ -349,6 +349,11 @@ tcp_server_make(int port, zcio_tls_ctx *ctx, bool non_blocking) {
         return NULL;
     }
 
+    /* Allow rebinding a port still lingering in TIME_WAIT from a prior process,
+     * matching the UDP/multicast paths and the original iostreams server. */
+    int reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&reuse, sizeof reuse);
+
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;

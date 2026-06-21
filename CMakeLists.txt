@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(zcio
-    VERSION 0.8.1.0
+    VERSION 0.9.0.0
     DESCRIPTION "Pure C23 streaming I/O library (C rewrite of iostreams)"
     LANGUAGES C)
 
@@ -90,7 +90,11 @@ foreach(lib IN LISTS ZCIO_LIBS)
     target_include_directories(${lib} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-    target_compile_definitions(${lib} PRIVATE ZCIO_BUILDING)
+    target_compile_definitions(${lib} PRIVATE ZCIO_BUILDING
+        ZCIO_VERSION_STR="${PROJECT_VERSION}"
+        ZCIO_VER_MAJOR=${PROJECT_VERSION_MAJOR}
+        ZCIO_VER_MINOR=${PROJECT_VERSION_MINOR}
+        ZCIO_VER_PATCH=${PROJECT_VERSION_PATCH})
     if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${lib} PRIVATE -Wall -Wextra -Wno-unused-parameter)
     endif()

@@ -3,9 +3,20 @@
 #include "internal.h"
 #include <stdarg.h>
 
-#define ZCIO_VERSION_MAJOR 0
-#define ZCIO_VERSION_MINOR 1
-#define ZCIO_VERSION_PATCH 0
+/* Version is single-sourced from CMake (PROJECT_VERSION). The fallbacks keep a
+ * non-CMake/IDE compile of this TU building. */
+#ifndef ZCIO_VERSION_STR
+#  define ZCIO_VERSION_STR "0.0.0"
+#endif
+#ifndef ZCIO_VER_MAJOR
+#  define ZCIO_VER_MAJOR 0
+#endif
+#ifndef ZCIO_VER_MINOR
+#  define ZCIO_VER_MINOR 0
+#endif
+#ifndef ZCIO_VER_PATCH
+#  define ZCIO_VER_PATCH 0
+#endif
 
 static ZCIO_THREAD char g_err[512];
 
@@ -67,9 +78,9 @@ void zcio_init(void) {
 
 void zcio_shutdown(void) { g_inited = false; }
 
-const char *zcio_version_string(void) { return "0.1.0"; }
+const char *zcio_version_string(void) { return ZCIO_VERSION_STR; }
 void zcio_version(int *maj, int *min, int *pat) {
-    if (maj) *maj = ZCIO_VERSION_MAJOR;
-    if (min) *min = ZCIO_VERSION_MINOR;
-    if (pat) *pat = ZCIO_VERSION_PATCH;
+    if (maj) *maj = ZCIO_VER_MAJOR;
+    if (min) *min = ZCIO_VER_MINOR;
+    if (pat) *pat = ZCIO_VER_PATCH;
 }

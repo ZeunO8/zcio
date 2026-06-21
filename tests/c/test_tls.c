@@ -57,6 +57,9 @@ ZTEST(tls_loopback_roundtrip) {
     ZCHECK(cli != NULL);
     if (cli) {
         zcio_stream *cs = zcio_tcp_client_stream(cli);
+        /* already-secured guard: upgrading an already-TLS client must fail
+         * fast (not re-handshake), exercising zcio_tcp_client_tls_upgrade. */
+        ZCHECK(zcio_tcp_client_tls_upgrade(cli, cctx) < 0);
         ZCHECK_EQ(zcio_write_full(cs, "hello", 5), 5);
         char buf[8] = {0};
         int64_t got = zcio_read_full(cs, buf, 5);

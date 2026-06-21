@@ -95,6 +95,18 @@ All bindings sit on the same C ABI and ship with their own tests:
 
 Core, networking, TLS (OpenSSL), HTTP, and DNS are implemented and tested. The
 archive backend is implemented but opt-in (it pulls a non-canonical libarchive
-fork via FetchContent). Test coverage: serializer, ring, memory/counting bufs,
-TCP/UDP loopback, IPv4/DNS utilities, and a threaded TLS loopback exercising the
-custom-BIO-over-stream handshake.
+fork via FetchContent).
+
+**Test coverage: every one of the ~104 public C functions is exercised** by the
+C suite (14 executables run under CTest): serializer (bytes/bits/arrays/all
+scalar widths/positioning/status/count mode), ring + shared-memory attach,
+memory/counting streams, generic stream verbs (copy/seek/available/eof/flush),
+TCP (loopback, multi-client, `close_client`, wait/bytes-available), UDP
+(loopback + multi-peer demux), UDP multicast, DNS/IPv4 utilities, an in-process
+HTTP loopback covering GET/POST/PUT/DELETE/custom-request, archive round-trip
+(when compiled in), and a threaded TLS loopback exercising the
+custom-BIO-over-stream handshake plus the backend registry and cert/key loading.
+
+All three language bindings ship their own test suites at parity with the C API
+surface (Python 26 cases, Node, C++), each validated end-to-end through the C
+ABI including TCP/UDP/multicast/HTTP/TLS.
