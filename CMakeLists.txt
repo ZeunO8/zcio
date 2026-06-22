@@ -34,6 +34,27 @@ if(ZCIO_SANITIZE AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 # ---------------------------------------------------------------------------
+# TLS backend resolution
+# ---------------------------------------------------------------------------
+# Resolved before the source set and targets so a missing OpenSSL gracefully
+# degrades to the no-TLS backend (warn + compile TLS out) instead of failing
+# configuration outright. Demoting ZCIO_TLS here (a normal variable shadowing
+# the cache) means every later "STREQUAL openssl" check picks the right path.
+if(ZCIO_TLS STREQUAL "openssl")
+    find_package(OpenSSL)
+    if(OpenSSL_FOUND)
+        message(STATUS "zcio TLS backend: OpenSSL")
+    else()
+        message(WARNING "zcio: OpenSSL not found — building WITHOUT TLS support. "
+                        "Install an OpenSSL development package (or set OPENSSL_ROOT_DIR) "
+                        "and reconfigure to enable it.")
+        set(ZCIO_TLS "none")
+    endif()
+else()
+    message(STATUS "zcio TLS backend: none (TLS compiled out)")
+endif()
+
+# ---------------------------------------------------------------------------
 # Source set
 # ---------------------------------------------------------------------------
 set(ZCIO_SOURCES
@@ -75,14 +96,6 @@ if(ZCIO_BUILD_SHARED)
     # dllimport on Windows; exported through the INSTALL/BUILD interface.
     target_compile_definitions(zcio_shared INTERFACE ZCIO_SHARED)
     list(APPEND ZCIO_LIBS zcio_shared)
-endif()
-
-# Resolve optional backends once.
-if(ZCIO_TLS STREQUAL "openssl")
-    find_package(OpenSSL REQUIRED)
-    message(STATUS "zcio TLS backend: OpenSSL")
-else()
-    message(STATUS "zcio TLS backend: none (TLS compiled out)")
 endif()
 
 if(ZCIO_WITH_ARCHIVE)
