@@ -96,6 +96,14 @@ if(ZCIO_BUILD_SHARED)
     # dllimport on Windows; exported through the INSTALL/BUILD interface.
     target_compile_definitions(zcio_shared INTERFACE ZCIO_SHARED)
     list(APPEND ZCIO_LIBS zcio_shared)
+
+    # On Windows the DLL's import library and the static library would both be
+    # named zcio.lib and collide (ninja: "multiple rules generate zcio.lib").
+    # Keep zcio.lib as the DLL import lib (the primary link target) and give the
+    # static archive a distinct name, mirroring zlib's zlibstatic convention.
+    if(WIN32)
+        set_target_properties(zcio PROPERTIES OUTPUT_NAME zcio_static)
+    endif()
 endif()
 
 if(ZCIO_WITH_ARCHIVE)
