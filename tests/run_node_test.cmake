@@ -9,10 +9,24 @@
 set(ENV{ZCIO_LIB_DIR} "${LIB_DIR}")
 set(ENV{DYLD_LIBRARY_PATH} "${LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
 set(ENV{LD_LIBRARY_PATH}   "${LIB_DIR}:$ENV{LD_LIBRARY_PATH}")
+if(CMAKE_HOST_WIN32)
+    # Windows resolves an addon's dependent DLLs (zcio.dll) via PATH, not the
+    # *_LIBRARY_PATH vars above. Make the freshly-built lib dir discoverable.
+    file(TO_NATIVE_PATH "${LIB_DIR}" _lib_dir_native)
+    set(ENV{PATH} "${_lib_dir_native};$ENV{PATH}")
+endif()
+
+# node-gyp's launcher is npx; on Windows that resolves to npx.cmd, which must be
+# run through cmd /c (execute_process cannot exec a batch file directly).
+if(CMAKE_HOST_WIN32)
+    set(_npx_cmd cmd /c "${NPX}" --yes node-gyp rebuild)
+else()
+    set(_npx_cmd "${NPX}" --yes node-gyp rebuild)
+endif()
 
 message(STATUS "node binding: building addon (ZCIO_LIB_DIR=${LIB_DIR})")
 execute_process(
-    COMMAND "${NPX}" --yes node-gyp rebuild
+    COMMAND ${_npx_cmd}
     WORKING_DIRECTORY "${NODE_DIR}"
     RESULT_VARIABLE build_rc
     OUTPUT_VARIABLE build_out

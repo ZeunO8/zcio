@@ -64,7 +64,9 @@ if(ZCIO_BUILD_BINDING_TESTS)
 
         # --- Node (N-API) ---
         find_program(ZCIO_NODE NAMES node)
-        find_program(ZCIO_NPX  NAMES npx)
+        # On Windows the launcher is npx.cmd; the extensionless "npx" is a Unix
+        # shell script that cannot be executed directly, so prefer the .cmd.
+        find_program(ZCIO_NPX  NAMES npx.cmd npx)
         if(ZCIO_NODE AND ZCIO_NPX)
             add_test(NAME binding_node COMMAND ${CMAKE_COMMAND}
                 -DNODE=${ZCIO_NODE} -DNPX=${ZCIO_NPX}

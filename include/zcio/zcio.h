@@ -39,12 +39,12 @@ extern "C" {
 /* Library-wide one-time initialization (socket subsystem, TLS backend). Safe to
  * call multiple times and from multiple threads; only the first call does work.
  * Most constructors call this implicitly, but binding layers may call it eagerly. */
-void zcio_init(void);
-void zcio_shutdown(void);
+ZCIO_API void zcio_init(void);
+ZCIO_API void zcio_shutdown(void);
 
 /* Semantic version string, e.g. "0.1.0". */
-const char *zcio_version_string(void);
-void        zcio_version(int *major, int *minor, int *patch);
+ZCIO_API const char *zcio_version_string(void);
+ZCIO_API void        zcio_version(int *major, int *minor, int *patch);
 
 #ifdef __cplusplus
 }

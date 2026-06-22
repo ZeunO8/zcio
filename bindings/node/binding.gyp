@@ -10,13 +10,26 @@
       "sources": [ "zcio_addon.c" ],
       "include_dirs": [ "<(module_root_dir)/../../include" ],
       "defines": [ "NAPI_VERSION=8" ],
-      "cflags": [ "-std=c11", "-Wall" ],
-      "cflags_c": [ "-std=c11", "-Wall" ],
-      "libraries": [ "-L<(zcio_lib_dir)", "-lzcio" ],
-      "ldflags": [ "-Wl,-rpath,<(zcio_lib_dir)" ],
-      "xcode_settings": {
-        "OTHER_LDFLAGS": [ "-Wl,-rpath,<(zcio_lib_dir)" ]
-      }
+      "conditions": [
+        [ "OS=='win'", {
+          # MSVC link.exe: name the DLL import lib and add its directory to the
+          # search path. The GNU-style -L/-l flags below are not understood here.
+          "libraries": [ "zcio.lib" ],
+          "msvs_settings": {
+            "VCLinkerTool": {
+              "AdditionalLibraryDirectories": [ "<(zcio_lib_dir)" ]
+            }
+          }
+        }, {
+          "cflags": [ "-std=c11", "-Wall" ],
+          "cflags_c": [ "-std=c11", "-Wall" ],
+          "libraries": [ "-L<(zcio_lib_dir)", "-lzcio" ],
+          "ldflags": [ "-Wl,-rpath,<(zcio_lib_dir)" ],
+          "xcode_settings": {
+            "OTHER_LDFLAGS": [ "-Wl,-rpath,<(zcio_lib_dir)" ]
+          }
+        } ]
+      ]
     }
   ]
 }
