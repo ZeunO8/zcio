@@ -112,6 +112,9 @@ if(ZCIO_WITH_ARCHIVE)
         target_compile_options(archive_static PRIVATE
             -Wno-deprecated-declarations -Wno-incompatible-pointer-types-discards-qualifiers)
     endif()
+    message(STATUS "zcio: archive support enabled (set -DZCIO_WITH_ARCHIVE=OFF to disable)")
+else()
+    message(STATUS "zcio: archive support disabled (set -DZCIO_WITH_ARCHIVE=ON to enable)")
 endif()
 
 foreach(lib IN LISTS ZCIO_LIBS)
