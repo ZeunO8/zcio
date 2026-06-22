@@ -35,8 +35,17 @@
 #endif
 
 /* C23 gives us [[nodiscard]] / [[maybe_unused]] as standard attributes. Guard
- * for older toolchains and C++ so the public header stays universally includable. */
-#if defined(__has_c_attribute)
+ * for older toolchains and C++ so the public header stays universally includable.
+ *
+ * On GCC/Clang prefer the __attribute__ spelling: ZCIO_API places this macro
+ * after __declspec(dllexport/dllimport) on Windows shared builds, and a C23
+ * [[nodiscard]] in that position binds to the return *type* (clang-cl rejects it
+ * with "attribute cannot be applied to types"). The GNU attribute attaches to
+ * the function regardless of where it sits relative to __declspec. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define ZCIO_NODISCARD     __attribute__((warn_unused_result))
+#  define ZCIO_MAYBE_UNUSED  __attribute__((unused))
+#elif defined(__has_c_attribute)
 #  if __has_c_attribute(nodiscard)
 #    define ZCIO_NODISCARD [[nodiscard]]
 #  endif

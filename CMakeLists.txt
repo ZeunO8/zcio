@@ -134,7 +134,13 @@ foreach(lib IN LISTS ZCIO_LIBS)
         ZCIO_VER_MAJOR=${PROJECT_VERSION_MAJOR}
         ZCIO_VER_MINOR=${PROJECT_VERSION_MINOR}
         ZCIO_VER_PATCH=${PROJECT_VERSION_PATCH})
-    if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+    if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        # clang-cl / MSVC: GCC-style -Wall expands to -Weverything-class noise
+        # here (pre-c23-compat, padded, unsafe-buffer-usage, ...). Use an MSVC
+        # warning level instead. /W3 mirrors the intent of -Wall -Wextra without
+        # the pedantic level-4 unused-parameter churn the vtable callbacks trip.
+        target_compile_options(${lib} PRIVATE /W3)
+    elseif(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         target_compile_options(${lib} PRIVATE -Wall -Wextra -Wno-unused-parameter)
     endif()
     if(ZCIO_TLS STREQUAL "openssl")
