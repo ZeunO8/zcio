@@ -5,6 +5,20 @@
 #ifndef ZTEST_H
 #define ZTEST_H
 
+/* On Windows, establish the Winsock2 include order ONCE, before any other header
+ * (including <windows.h>, pulled in by zthread.h) can drag in the legacy
+ * <winsock.h> — which collides with <winsock2.h> on IPPROTO and sockaddr_in.
+ * ztest.h is the first include in every C test, so this also guarantees
+ * socklen_t (from <ws2tcpip.h>) is available to internal_port.h. */
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#  include <windows.h>
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
