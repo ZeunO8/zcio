@@ -7,12 +7,21 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <unistd.h>
+#if defined(_WIN32)
+#  include <process.h>   // _getpid
+#else
+#  include <unistd.h>    // getpid
+#endif
 
 // Derive a per-process port base so rapid re-runs avoid TIME_WAIT collisions
 // on fixed ports. Range stays well inside the ephemeral space.
 static int port_base() {
-    return 39000 + (static_cast<int>(::getpid()) % 2000);
+#if defined(_WIN32)
+    int pid = static_cast<int>(_getpid());
+#else
+    int pid = static_cast<int>(::getpid());
+#endif
+    return 39000 + (pid % 2000);
 }
 
 static int failures = 0;

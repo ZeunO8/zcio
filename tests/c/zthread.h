@@ -6,7 +6,14 @@
 #define ZTHREAD_H
 
 #if defined(_WIN32)
+/* Keep <windows.h> from pulling in the legacy <winsock.h>; tests that also
+ * include <winsock2.h> (via internal_port.h) would otherwise hit IPPROTO_* and
+ * sockaddr_in redefinition errors. */
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
 #  include <windows.h>
+#  include <stdlib.h>   /* malloc/free used in the thread trampoline below */
 
 typedef HANDLE zthread_t;
 typedef struct { void *(*fn)(void *); void *arg; } zthread_trampoline_;

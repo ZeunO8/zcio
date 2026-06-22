@@ -25,6 +25,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
+# On MSVC-like front ends (incl. clang-cl) the UCRT marks standard functions
+# such as fopen/strdup deprecated in favour of _s / underscore-prefixed names.
+# Opt out globally so the portable library and tests stay warning-clean.
+if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS)
+endif()
+
 # Sanitizers apply globally (library + tests) so ctest exercises instrumented
 # code. Compile and link must both carry the flag.
 if(ZCIO_SANITIZE AND CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
