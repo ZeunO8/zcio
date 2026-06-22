@@ -58,7 +58,9 @@ static int64_t tcp_s_read(void *c, void *dst, size_t n) {
     do {
         got = recv(s->fd, (char *)dst, (int)n, 0);
     } while (got < 0
-#if !defined(_WIN32)
+#if defined(_WIN32)
+             && WSAGetLastError() == WSAEINTR
+#else
              && errno == EINTR
 #endif
             );
@@ -85,7 +87,9 @@ static int64_t tcp_s_write(void *c, const void *src, size_t n) {
     do {
         sent = send(s->fd, (const char *)src, (int)n, ZCIO_SEND_FLAGS);
     } while (sent < 0
-#if !defined(_WIN32)
+#if defined(_WIN32)
+             && WSAGetLastError() == WSAEINTR
+#else
              && errno == EINTR
 #endif
             );
@@ -482,7 +486,9 @@ zcio_tcp_conn *zcio_tcp_server_accept(zcio_tcp_server *s, size_t *out_id, int ti
         clen = sizeof caddr;
         cfd = accept(s->listen_fd, (struct sockaddr *)&caddr, &clen);
     } while (cfd == ZCIO_INVALID_SOCKET
-#if !defined(_WIN32)
+#if defined(_WIN32)
+             && WSAGetLastError() == WSAEINTR
+#else
              && errno == EINTR
 #endif
             );
