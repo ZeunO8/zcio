@@ -54,6 +54,16 @@ int zcio_select_eintr(zcio_socket fd, bool want_read, bool want_write,
         FD_ZERO(&wfds);
         if (want_read)  FD_SET(fd, &rfds);
         if (want_write) FD_SET(fd, &wfds);
+#if defined(_WIN32)
+        /* Winsock signals a failed/aborted connection (a pending SO_ERROR such
+         * as WSAECONNRESET) through exceptfds, not writefds. Without watching
+         * it, a write-wait on a peer that has gone away blocks for the entire
+         * timeout instead of waking at once like POSIX (where the error makes
+         * the socket select-readable/writable). Watch it so we wake promptly. */
+        fd_set efds;
+        FD_ZERO(&efds);
+        if (want_read || want_write) FD_SET(fd, &efds);
+#endif
 
         struct timeval tv, *ptv = NULL;
         if (timeout_ms >= 0) {
@@ -64,9 +74,21 @@ int zcio_select_eintr(zcio_socket fd, bool want_read, bool want_write,
             ptv = &tv;
         }
 
+#if defined(_WIN32)
+        int rc = select((int)(fd + 1), want_read ? &rfds : NULL,
+                        want_write ? &wfds : NULL,
+                        (want_read || want_write) ? &efds : NULL, ptv);
+        /* An exception means a pending error: report the waited-for direction
+         * as ready so the caller proceeds to send/recv and surfaces the real
+         * code (e.g. WSAECONNRESET) rather than a spurious timeout. */
+        if (rc > 0 && FD_ISSET(fd, &efds)) {
+            if (out_read)  *out_read  = want_read;
+            if (out_write) *out_write = want_write;
+            return rc;
+        }
+#else
         int rc = select((int)(fd + 1), want_read ? &rfds : NULL,
                         want_write ? &wfds : NULL, NULL, ptv);
-#if !defined(_WIN32)
         if (rc < 0 && errno == EINTR) {
             if (timeout_ms < 0) continue;              /* infinite: just retry  */
             if (deadline - zcio_now_ms() > 0) continue; /* time left: retry      */
