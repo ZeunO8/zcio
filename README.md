@@ -65,13 +65,39 @@ test compiles its native addon on demand via `node-gyp`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `ZCIO_TLS` | `openssl` | TLS backend: `openssl` or `none` |
+| `ZCIO_TLS` | `openssl` (`none` on iOS/Android) | TLS backend: `openssl` or `none` |
 | `ZCIO_WITH_ARCHIVE` | `OFF` | libarchive support (FetchContent-clones a fork; opt in) |
-| `ZCIO_BUILD_TESTS` | `ON` | build the C test suite |
+| `ZCIO_BUILD_TESTS` | `ON` (`OFF` when cross-compiling) | build the C test suite |
 | `ZCIO_BUILD_SHARED` | `OFF` | also build `libzcio` shared (needed for the Python/Node bindings) |
 | `ZCIO_BUILD_BINDING_TESTS` | `ON` | register the C++/Python/Node binding tests in CTest |
 
 To build with no TLS dependency at all: `-DZCIO_TLS=none`.
+
+### iOS & Android (zero dependencies)
+
+zcio builds for iOS and Android out of the box using only core OS system
+libraries (libc + BSD sockets) — no OpenSSL, no libarchive, nothing to vendor.
+On mobile targets the TLS backend defaults to `none` and the host-run test
+suite is skipped automatically. `CMakePresets.json` covers the common targets:
+
+```sh
+# iOS (run on macOS with Xcode installed)
+cmake --preset ios           && cmake --build --preset ios
+cmake --preset ios-simulator && cmake --build --preset ios-simulator
+
+# Android (point ANDROID_NDK_ROOT at an installed NDK)
+export ANDROID_NDK_ROOT="$HOME/Library/Android/sdk/ndk/<version>"
+cmake --preset android-arm64  && cmake --build --preset android-arm64
+# also: android-armv7, android-x86_64
+```
+
+Each preset produces a static `libzcio.a` under `build/<preset>/`; on Android,
+`-DZCIO_BUILD_SHARED=ON` additionally yields a `libzcio.so` that links against
+nothing beyond the system libc. The device presets target iOS 13+ and Android
+API 24+ (override `ANDROID_PLATFORM` / `CMAKE_OSX_DEPLOYMENT_TARGET` to taste),
+and CI cross-builds all five mobile targets on every push. One runtime note:
+UDP multicast on iOS requires the `com.apple.developer.networking.multicast`
+entitlement, and on Android a `WifiManager.MulticastLock`.
 
 ### Install & consume
 
@@ -127,7 +153,9 @@ All bindings sit on the same C ABI and ship with their own tests:
 
 Core, networking, TLS (OpenSSL), HTTP, and DNS are implemented and tested. The
 archive backend is implemented but opt-in (it pulls a non-canonical libarchive
-fork via FetchContent).
+fork via FetchContent). Desktop (Linux/macOS/Windows) is tested end-to-end in
+CI; iOS and Android are cross-compiled in CI as dependency-free static
+libraries (the whole core is plain POSIX, so the same code paths run there).
 
 **Test coverage: every one of the ~104 public C functions is exercised** by the
 C suite (14 executables run under CTest): serializer (bytes/bits/arrays/all

@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.20)
+# 3.21+: first release that accepts CMAKE_C_STANDARD 23 and preset schema v3
+# (toolchainFile / conditions), which the iOS/Android presets rely on.
+cmake_minimum_required(VERSION 3.21)
 
 project(zcio
     VERSION 1.0.8.0
@@ -8,12 +10,34 @@ project(zcio
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-set(ZCIO_TLS "openssl" CACHE STRING "TLS backend: openssl | none")
+# Mobile targets (the iOS family and Android) build dependency-free by
+# default: neither OS ships OpenSSL as a public system library, so TLS
+# defaults to the "none" backend there and archive support stays opt-in.
+# Everything else zcio uses is core OS on both (libc, BSD sockets).
+if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|watchOS|visionOS)$" OR ANDROID)
+    set(ZCIO_MOBILE ON)
+else()
+    set(ZCIO_MOBILE OFF)
+endif()
+
+if(ZCIO_MOBILE)
+    set(ZCIO_TLS_DEFAULT "none")
+else()
+    set(ZCIO_TLS_DEFAULT "openssl")
+endif()
+set(ZCIO_TLS "${ZCIO_TLS_DEFAULT}" CACHE STRING "TLS backend: openssl | none")
 set_property(CACHE ZCIO_TLS PROPERTY STRINGS openssl none)
 # Off by default: the archive backend FetchContent-clones a non-canonical
 # libarchive fork. Opt in explicitly with -DZCIO_WITH_ARCHIVE=ON.
 option(ZCIO_WITH_ARCHIVE "Build libarchive-backed archive support" OFF)
-option(ZCIO_BUILD_TESTS   "Build the C test suite"                  ON)
+# Tests are host-run via ctest; when cross-compiling (iOS, Android, ...) the
+# binaries cannot execute on the build machine, so default them off there.
+if(CMAKE_CROSSCOMPILING)
+    set(ZCIO_TESTS_DEFAULT OFF)
+else()
+    set(ZCIO_TESTS_DEFAULT ON)
+endif()
+option(ZCIO_BUILD_TESTS   "Build the C test suite"                  ${ZCIO_TESTS_DEFAULT})
 option(ZCIO_BUILD_SHARED  "Build a shared library too"              OFF)
 set(ZCIO_SANITIZE "" CACHE STRING "Sanitizers as a comma list, e.g. address,undefined,thread")
 
@@ -136,11 +160,15 @@ foreach(lib IN LISTS ZCIO_LIBS)
     target_include_directories(${lib} PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
+    # PIC unconditionally: the static archive is routinely linked into shared
+    # binding/app libraries (Android .so, Python/Node modules, iOS frameworks).
+    set_target_properties(${lib} PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(${lib} PRIVATE ZCIO_BUILDING
         ZCIO_VERSION_STR="${PROJECT_VERSION}"
         ZCIO_VER_MAJOR=${PROJECT_VERSION_MAJOR}
         ZCIO_VER_MINOR=${PROJECT_VERSION_MINOR}
-        ZCIO_VER_PATCH=${PROJECT_VERSION_PATCH})
+        ZCIO_VER_PATCH=${PROJECT_VERSION_PATCH}
+        ZCIO_VER_TWEAK=${PROJECT_VERSION_TWEAK})
     if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         # clang-cl / MSVC: GCC-style -Wall expands to -Weverything-class noise
         # here (pre-c23-compat, padded, unsafe-buffer-usage, ...). Use an MSVC

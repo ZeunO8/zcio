@@ -56,6 +56,32 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+  # Mobile cross-builds: iOS (device + simulator) and Android (three ABIs),
+  # all dependency-free (TLS defaults to "none" on these targets; tests are
+  # host-run and auto-skipped). Uses the checked-in CMake presets, so CI runs
+  # exactly what the README tells users to run.
+  mobile:
+    name: ${{ matrix.preset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest,  preset: ios }
+          - { os: macos-latest,  preset: ios-simulator }
+          - { os: ubuntu-latest, preset: android-arm64 }
+          - { os: ubuntu-latest, preset: android-armv7 }
+          - { os: ubuntu-latest, preset: android-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Point ANDROID_NDK_ROOT at the runner's NDK
+        if: runner.os == 'Linux'
+        run: echo "ANDROID_NDK_ROOT=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }}
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
   # Windows: validate the core + networking build and C tests with TLS compiled
   # out (avoids OpenSSL provisioning friction); binding tests are POSIX-driven.
   windows:
