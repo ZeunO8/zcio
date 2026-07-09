@@ -5,6 +5,25 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.2.0.0] - 2026-07-09
+
+### Added
+- **On-target mobile testing** (`cmake/ZcioMobileTest.cmake`): cross-compiled
+  test suites now run through CTest via `CMAKE_CROSSCOMPILING_EMULATOR` — an
+  `adb` push-and-run launcher for Android (emulator or device, exit codes
+  propagated) and an `xcrun simctl spawn` launcher for the iOS simulator.
+  Opt in with `-DZCIO_BUILD_TESTS=ON` on a cross build; a plain `ctest` then
+  behaves like a host run. Dependents embedding zcio can reuse the launcher
+  for their own suites (`zcio_enable_mobile_testing()`), staging extra
+  on-device runtime files per test via a `ZCIO_PUSH_FILES` environment list.
+  Verified: full suite green on an Android 16 arm64 emulator and an iOS 26.5
+  simulator.
+
+### Fixed
+- `test_tls_more` failed to *compile* against the iOS SDK, where `system()`
+  is marked unavailable; cert generation now degrades to the documented
+  "openssl CLI unavailable" skip there.
+
 ## [1.1.0.0] - 2026-07-09
 
 ### Added

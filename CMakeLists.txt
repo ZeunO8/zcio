@@ -3,7 +3,7 @@
 cmake_minimum_required(VERSION 3.21)
 
 project(zcio
-    VERSION 1.1.0.0
+    VERSION 1.2.0.0
     DESCRIPTION "Pure C23 streaming I/O library (C rewrite of iostreams)"
     LANGUAGES C)
 
@@ -260,6 +260,14 @@ install(FILES ${CMAKE_CURRENT_BINARY_DIR}/zcio.pc
 # Tests
 # ---------------------------------------------------------------------------
 if(ZCIO_BUILD_TESTS)
+    # Cross-compiled suites (Android, iOS simulator) run on-target through a
+    # launcher: adb push+shell or simctl spawn. Must be set up before the test
+    # targets exist so they inherit CROSSCOMPILING_EMULATOR. No-op on host
+    # builds and on targets with no host-driven runner (physical iOS).
+    if(CMAKE_CROSSCOMPILING)
+        include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/ZcioMobileTest.cmake)
+        zcio_enable_mobile_testing()
+    endif()
     enable_testing()
     include(${CMAKE_CURRENT_SOURCE_DIR}/tests/Tests.cmake)
 endif()
