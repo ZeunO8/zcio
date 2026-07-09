@@ -5,6 +5,20 @@
 #include "zcio/zcio.h"
 #include <stdlib.h>
 #include <stdio.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
+
+/* system() is marked unavailable in the iOS SDK (and there is no openssl CLI
+ * on-device anyway) — resolve to "generation failed" so the skip path fires. */
+static int run_cmd(const char *cmd) {
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    (void)cmd;
+    return -1;
+#else
+    return system(cmd);
+#endif
+}
 
 ZTEST(tls_backend_registry) {
     zcio_init();
@@ -35,7 +49,7 @@ ZTEST(tls_server_ctx_files) {
         "openssl req -x509 -newkey rsa:2048 -nodes -days 1 "
         "-keyout %s -out %s -subj /CN=localhost >/dev/null 2>&1",
         key, crt);
-    int rc = system(cmd);
+    int rc = run_cmd(cmd);
     FILE *fk = fopen(key, "r");
     FILE *fc = fopen(crt, "r");
     int generated = (rc == 0 && fk && fc);

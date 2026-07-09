@@ -1,0 +1,14 @@
+#!/bin/sh
+# iOS-simulator test launcher, configured by ZcioMobileTest.cmake.
+#
+# CTest invokes this as:  simctl_runner.sh <host-path-to-test-exe> [args...]
+# (CMAKE_CROSSCOMPILING_EMULATOR prefixes every registered test command.)
+#
+# simctl spawn runs a simulator-arch binary inside the booted simulator
+# runtime; the simulator shares the host filesystem, so host paths (the
+# executable, /tmp scratch files, fixture dylibs) work unchanged. The target
+# device defaults to "booted" — boot one first with `xcrun simctl boot <udid>`
+# — and can be overridden per run with ZCIO_SIM_DEVICE=<udid>.
+set -eu
+
+exec xcrun simctl spawn "${ZCIO_SIM_DEVICE:-@ZCIO_SIM_DEVICE@}" "$@"

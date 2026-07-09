@@ -144,8 +144,9 @@ To build with no TLS dependency at all: `-DZCIO_TLS=none`.
 
 zcio builds for iOS and Android out of the box using only core OS system
 libraries (libc + BSD sockets) — no OpenSSL, no libarchive, nothing to vendor.
-On mobile targets the TLS backend defaults to `none` and the host-run test
-suite is skipped automatically. `CMakePresets.json` covers the common targets:
+On mobile targets the TLS backend defaults to `none` and the test suite
+defaults off (opt back in to run it on-target — see below).
+`CMakePresets.json` covers the common targets:
 
 ```sh
 # iOS (run on macOS with Xcode installed)
@@ -157,6 +158,35 @@ export ANDROID_NDK_ROOT="$HOME/Library/Android/sdk/ndk/<version>"
 cmake --preset android-arm64  && cmake --build --preset android-arm64
 # also: android-armv7, android-x86_64
 ```
+
+### On-target mobile testing
+
+Cross-compiled binaries can't execute on the build host, so passing
+`-DZCIO_BUILD_TESTS=ON` on a cross build wires `CMAKE_CROSSCOMPILING_EMULATOR`
+to a launcher (`cmake/ZcioMobileTest.cmake`): `adb` push-and-run for Android
+(emulator or USB device), `xcrun simctl spawn` into the booted simulator for
+iOS. A plain `ctest` then behaves exactly like a host run — TLS/archive tests
+self-skip on the dependency-free mobile builds.
+
+```sh
+# Android: boot an emulator (or attach a device), then
+cmake --preset android-arm64 -DZCIO_BUILD_TESTS=ON
+cmake --build --preset android-arm64
+ctest --test-dir build/android-arm64 --output-on-failure
+
+# iOS simulator: boot one, then
+xcrun simctl boot "iPhone 17 Pro"
+cmake --preset ios-simulator -DZCIO_BUILD_TESTS=ON
+cmake --build --preset ios-simulator
+ctest --test-dir build/ios-simulator --output-on-failure
+```
+
+Projects embedding zcio can reuse the launcher for their own cross-compiled
+suites: `include(${zcio_SOURCE_DIR}/cmake/ZcioMobileTest.cmake)`, call
+`zcio_enable_mobile_testing()` before registering test targets, and stage any
+extra on-device runtime files by setting the test's `ZCIO_PUSH_FILES`
+environment variable to a colon-separated list of host paths (Android; the
+iOS simulator shares the host filesystem, so host paths just work).
 
 Each preset produces a static `libzcio.a` under `build/<preset>/`; on Android,
 `-DZCIO_BUILD_SHARED=ON` additionally yields a `libzcio.so` that links against

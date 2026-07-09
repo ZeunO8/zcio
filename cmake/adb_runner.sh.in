@@ -1,0 +1,34 @@
+#!/bin/sh
+# adb push-and-run test launcher, configured by ZcioMobileTest.cmake.
+#
+# CTest invokes this as:  adb_runner.sh <host-path-to-test-exe> [args...]
+# (CMAKE_CROSSCOMPILING_EMULATOR prefixes every registered test command.)
+#
+# The executable is pushed to @ZCIO_ANDROID_DEVICE_DIR@ and run there, so
+# tests may read/write files in their working directory. Additional runtime
+# files (shared-library fixtures, data files) can be staged by setting
+# ZCIO_PUSH_FILES in the test's ENVIRONMENT to a colon-separated list of host
+# paths; each is pushed beside the executable before it runs.
+#
+# Exit code: adb's shell protocol v2 (API >= 24) propagates the remote exit
+# status, which is what CTest grades on.
+set -eu
+
+ADB="@ZCIO_ADB@"
+DEV_DIR="@ZCIO_ANDROID_DEVICE_DIR@"
+
+exe="$1"; shift
+name="$(basename "$exe")"
+
+"$ADB" shell "mkdir -p '$DEV_DIR'" > /dev/null
+"$ADB" push --sync "$exe" "$DEV_DIR/$name" > /dev/null
+
+if [ -n "${ZCIO_PUSH_FILES:-}" ]; then
+    old_ifs=$IFS; IFS=':'
+    for f in $ZCIO_PUSH_FILES; do
+        [ -n "$f" ] && "$ADB" push --sync "$f" "$DEV_DIR/$(basename "$f")" > /dev/null
+    done
+    IFS=$old_ifs
+fi
+
+exec "$ADB" shell "cd '$DEV_DIR' && chmod 755 './$name' && './$name' $*"
