@@ -143,6 +143,59 @@ ZTEST(http_chunked_body) {
     zthread_join(th);
 }
 
+/* Per-request deadline, stalled mid-body: the server sends headers plus 5 of a
+ * promised 100 body bytes, then goes silent while holding the connection. The
+ * caller's overall timeout_ms must bound the call — without it the read blocks
+ * for the 30 s per-op transport default. */
+ZTEST(http_deadline_stalled_body) {
+    zcio_init();
+    ka_arg arg = { .port = ztest_free_port(), .ready = 0, .hold_ms = 8000,
+                   .response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Length: 100\r\n"
+        "\r\n"
+        "hello" };
+    zthread_t th;
+    zthread_start(&th, keepalive_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/", arg.port);
+
+    zcio_http_opts opts = { .timeout_ms = 500 };
+    time_t t0 = time(NULL);
+    zcio_http_response r = zcio_http_request_opts("GET", url, NULL, 0, NULL, 0, &opts);
+    time_t elapsed = time(NULL) - t0;
+    ZCHECK_EQ(r.status, 0);
+    ZCHECK(elapsed < 4);
+    zcio_http_response_free(&r);
+    zthread_join(th);
+}
+
+/* Per-request deadline, server never sends a byte after accepting. */
+ZTEST(http_deadline_silent_server) {
+    zcio_init();
+    ka_arg arg = { .port = ztest_free_port(), .ready = 0, .hold_ms = 8000,
+                   .response = "" };
+    zthread_t th;
+    zthread_start(&th, keepalive_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/", arg.port);
+
+    zcio_http_opts opts = { .connect_timeout_ms = 2000, .timeout_ms = 500 };
+    time_t t0 = time(NULL);
+    zcio_http_response r = zcio_http_request_opts("GET", url, NULL, 0, NULL, 0, &opts);
+    time_t elapsed = time(NULL) - t0;
+    ZCHECK_EQ(r.status, 0);
+    ZCHECK(elapsed < 4);
+    zcio_http_response_free(&r);
+    zthread_join(th);
+}
+
 ZTEST(http_get_bad_host) {
     zcio_init();
     /* unresolvable host: must return a zeroed response (status 0), not crash */

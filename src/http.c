@@ -273,6 +273,19 @@ oom:
     return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory building request");
 }
 
+/* ------------------------------ deadlines ------------------------------- */
+
+/* Milliseconds left before `deadline` (a zcio_now_ms_() instant; 0 = none).
+ * Returns -1 for "no deadline", 0 when already expired, else the remainder
+ * clamped to INT_MAX. */
+static int deadline_remaining_ms(uint64_t deadline) {
+    if (deadline == 0) return -1;
+    uint64_t now = zcio_now_ms_();
+    if (now >= deadline) return 0;
+    uint64_t rem = deadline - now;
+    return rem > (uint64_t)INT_MAX ? INT_MAX : (int)rem;
+}
+
 /* --------------------------- response reading --------------------------- */
 
 static char *find_header_value(const char *hdr_begin, const char *hdr_end, const char *key);
@@ -315,8 +328,10 @@ static int chunked_scan(const char *p, const char *end, size_t *decoded_len, cha
  * once the header block is complete, stop as soon as a Content-Length body is
  * fully buffered or a chunked body is terminated; otherwise (no framing info)
  * read to EOF — we requested Connection: close, so EOF delimits the message
- * even against keep-alive servers. */
-static int read_response(zcio_stream *s, buf_t *out) {
+ * even against keep-alive servers. `deadline` (0 = none) bounds the WHOLE
+ * read: each read's transport timeout is re-armed to the time remaining and
+ * expiry fails with ZCIO_ERR_TIMEOUT. */
+static int read_response(zcio_stream *s, buf_t *out, uint64_t deadline) {
     memset(out, 0, sizeof *out);
     char chunk[8192];
     bool   hdr_done = false;
@@ -324,6 +339,15 @@ static int read_response(zcio_stream *s, buf_t *out) {
     long long content_len = -1;       /* -1 = unknown */
     bool   chunked = false;
     for (;;) {
+        int rem = deadline_remaining_ms(deadline);
+        if (rem >= 0) {
+            if (rem == 0) {
+                free(out->data);
+                memset(out, 0, sizeof *out);
+                return zcio_fail_(ZCIO_ERR_TIMEOUT, "http: request deadline exceeded");
+            }
+            (void)zcio_stream_set_timeout_(s, rem);
+        }
         int64_t r = zcio_read(s, chunk, sizeof chunk);
         if (r < 0) {
             free(out->data);
@@ -604,7 +628,8 @@ static int do_exchange(const char *method, const char *url,
                        const zcio_http_header *headers, size_t header_count,
                        const void *body, size_t body_len,
                        zcio_http_response *resp, char **location_out,
-                       zcio_url *prev) {
+                       zcio_url *prev,
+                       int connect_timeout_ms, uint64_t deadline) {
     memset(resp, 0, sizeof *resp);
     if (location_out) *location_out = NULL;
 
@@ -627,16 +652,26 @@ static int do_exchange(const char *method, const char *url,
         }
     }
 
-    /* Establish connection. */
+    /* Establish connection. The connect wait and the per-op transport timeout
+     * (which also governs the TLS handshake) are both clamped to whatever is
+     * left of the overall deadline. */
+    int rem = deadline_remaining_ms(deadline);
+    if (rem == 0) {
+        if (prev) url_free(prev);
+        url_free(&u);
+        return zcio_fail_(ZCIO_ERR_TIMEOUT, "http: request deadline exceeded");
+    }
+    int cto = connect_timeout_ms;
+    if (rem > 0 && (cto <= 0 || cto > rem)) cto = rem;
+    int ioto = rem > 0 ? rem : 0;
+
     zcio_tls_ctx *tls = NULL;
     zcio_tcp_client *client = NULL;
     if (u.secure) {
         tls = zcio_tls_client_ctx(u.host);
         if (!tls) { url_free(&u); return zcio_fail_(ZCIO_ERR_TLS, "http: TLS context creation failed"); }
-        client = zcio_tcp_client_connect_tls(u.host, u.port, tls, true);
-    } else {
-        client = zcio_tcp_client_connect(u.host, u.port);
     }
+    client = zcio_tcp_client_connect_opts_(u.host, u.port, tls, true, cto, ioto);
     if (!client) {
         if (tls) zcio_tls_ctx_free(tls);
         url_free(&u);
@@ -661,6 +696,16 @@ static int do_exchange(const char *method, const char *url,
         return br;
     }
 
+    rem = deadline_remaining_ms(deadline);
+    if (rem == 0) {
+        free(req.data);
+        zcio_tcp_client_free(client);
+        if (tls) zcio_tls_ctx_free(tls);
+        url_free(&u);
+        return zcio_fail_(ZCIO_ERR_TIMEOUT, "http: request deadline exceeded");
+    }
+    if (rem > 0) (void)zcio_stream_set_timeout_(s, rem);
+
     int64_t wrote = zcio_write_full(s, req.data, req.len);
     free(req.data);
     if (wrote < 0 || (size_t)wrote != req.len) {
@@ -672,7 +717,7 @@ static int do_exchange(const char *method, const char *url,
 
     /* Read the full response, then parse. */
     buf_t raw;
-    int rr = read_response(s, &raw);
+    int rr = read_response(s, &raw, deadline);
     zcio_tcp_client_free(client);
     if (tls) zcio_tls_ctx_free(tls);
     url_free(&u);
@@ -757,8 +802,20 @@ static int resolve_redirect(const zcio_url *prev, const char *location, char **o
 zcio_http_response zcio_http_request(const char *method, const char *url,
                                      const zcio_http_header *headers, size_t header_count,
                                      const void *body, size_t n) {
+    return zcio_http_request_opts(method, url, headers, header_count, body, n, NULL);
+}
+
+zcio_http_response zcio_http_request_opts(const char *method, const char *url,
+                                          const zcio_http_header *headers, size_t header_count,
+                                          const void *body, size_t n,
+                                          const zcio_http_opts *opts) {
     zcio_http_response resp;
     memset(&resp, 0, sizeof resp);
+
+    /* One deadline for the WHOLE call, redirects included. */
+    int connect_timeout_ms = opts ? opts->connect_timeout_ms : 0;
+    uint64_t deadline = (opts && opts->timeout_ms > 0)
+                      ? zcio_now_ms_() + (uint64_t)opts->timeout_ms : 0;
 
     char *current = zcio_strdup_(url);
     if (url && !current) {
@@ -770,7 +827,8 @@ zcio_http_response zcio_http_request(const char *method, const char *url,
         char *location = NULL;
         zcio_url prev;
         int r = do_exchange(method, current, headers, header_count, body, n,
-                            &resp, &location, &prev);
+                            &resp, &location, &prev,
+                            connect_timeout_ms, deadline);
         if (r != ZCIO_OK) {
             free(current);
             free(location);

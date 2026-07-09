@@ -5,6 +5,20 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.3.0] - 2026-07-09
+
+### Added
+- **Per-request HTTP timeouts**: `zcio_http_request_opts` takes a
+  `zcio_http_opts { connect_timeout_ms, timeout_ms }`. `timeout_ms` is a TOTAL
+  deadline for the whole call — connect, TLS handshake, send, receive, across
+  every redirect hop — surfacing `ZCIO_ERR_TIMEOUT` on expiry; the per-op
+  transport timeout is re-armed to the time remaining before every read.
+  `connect_timeout_ms` overrides the 15 s connect default (and is clamped to
+  the deadline). `opts == NULL` / zeroed fields keep the old behavior.
+  Regressions: `http_deadline_stalled_body`, `http_deadline_silent_server`.
+  Internal: `zcio_tcp_client_connect_opts_` presets the socket timeout before
+  the TLS wrap so the handshake honors the caller's deadline.
+
 ## [1.3.2.0] - 2026-07-09
 
 ### Fixed

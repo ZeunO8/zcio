@@ -201,8 +201,11 @@ int zcio_tcp_stream_set_timeout_(zcio_stream *s, int timeout_ms) {
 }
 
 /* ------------------------------- connect -------------------------------- */
-/* Returns a connected fd or ZCIO_INVALID_SOCKET (error message left). */
-static zcio_socket tcp_do_connect(const char *host, int port) {
+#define TCP_DEFAULT_CONNECT_TIMEOUT_MS 15000
+
+/* Returns a connected fd or ZCIO_INVALID_SOCKET (error message left).
+ * connect_timeout_ms <= 0 selects the default. */
+static zcio_socket tcp_do_connect(const char *host, int port, int connect_timeout_ms) {
     char *ip = zcio_resolve_ipv4(host);
     if (!ip) return ZCIO_INVALID_SOCKET; /* zcio_resolve_ipv4 set the error */
 
@@ -236,8 +239,9 @@ static zcio_socket tcp_do_connect(const char *host, int port) {
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0)
         return fd;
 
-    /* In-progress (non-blocking sockets); wait up to 15s. The original blocks
-     * via the default socket but tolerates EINPROGRESS, so we mirror it. */
+    /* In-progress (non-blocking sockets); wait up to the connect timeout. The
+     * original blocks via the default socket but tolerates EINPROGRESS, so we
+     * mirror it. */
 #if defined(_WIN32)
     int err = WSAGetLastError();
     bool inprog = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
@@ -245,7 +249,9 @@ static zcio_socket tcp_do_connect(const char *host, int port) {
     bool inprog = (errno == EINPROGRESS);
 #endif
     if (inprog) {
-        sock_wait w = tcp_wait(fd, 15000, false, true);
+        int cto = connect_timeout_ms > 0 ? connect_timeout_ms
+                                         : TCP_DEFAULT_CONNECT_TIMEOUT_MS;
+        sock_wait w = tcp_wait(fd, cto, false, true);
         if (w.rc > 0 && w.writable) {
             int so_error = 0;
             socklen_t len = sizeof so_error;
@@ -274,9 +280,10 @@ struct zcio_tcp_client {
 };
 
 static zcio_tcp_client *
-tcp_client_make(const char *host, int port, zcio_tls_ctx *ctx, bool verify) {
+tcp_client_make(const char *host, int port, zcio_tls_ctx *ctx, bool verify,
+                int connect_timeout_ms, int io_timeout_ms) {
     if (!host) { zcio_fail_(ZCIO_ERR_INVALID_ARG, "tcp_client: NULL host"); return NULL; }
-    zcio_socket fd = tcp_do_connect(host, port);
+    zcio_socket fd = tcp_do_connect(host, port, connect_timeout_ms);
     if (fd == ZCIO_INVALID_SOCKET) return NULL;
 
     zcio_stream *plain = tcp_make_plain_stream(fd);
@@ -285,6 +292,10 @@ tcp_client_make(const char *host, int port, zcio_tls_ctx *ctx, bool verify) {
         zcio_fail_(ZCIO_ERR_NOMEM, "tcp_client: out of memory");
         return NULL;
     }
+    /* Preset the per-op transport timeout BEFORE any TLS wrap so the handshake
+     * itself honors the caller's deadline. io_timeout_ms <= 0 keeps default. */
+    if (io_timeout_ms > 0)
+        ((tcp_sockctx *)plain->ctx)->timeout_ms = io_timeout_ms;
 
     zcio_stream *use = plain;
     if (ctx) {
@@ -310,12 +321,19 @@ tcp_client_make(const char *host, int port, zcio_tls_ctx *ctx, bool verify) {
 }
 
 zcio_tcp_client *zcio_tcp_client_connect(const char *host, int port) {
-    return tcp_client_make(host, port, NULL, false);
+    return tcp_client_make(host, port, NULL, false, 0, 0);
 }
 
 zcio_tcp_client *
 zcio_tcp_client_connect_tls(const char *host, int port, zcio_tls_ctx *ctx, bool verify) {
-    return tcp_client_make(host, port, ctx, verify);
+    return tcp_client_make(host, port, ctx, verify, 0, 0);
+}
+
+/* Internal (see internal.h): connect with explicit connect/IO timeouts. */
+zcio_tcp_client *
+zcio_tcp_client_connect_opts_(const char *host, int port, zcio_tls_ctx *ctx,
+                              bool verify, int connect_timeout_ms, int io_timeout_ms) {
+    return tcp_client_make(host, port, ctx, verify, connect_timeout_ms, io_timeout_ms);
 }
 
 void zcio_tcp_client_free(zcio_tcp_client *c) {

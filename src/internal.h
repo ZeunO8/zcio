@@ -102,6 +102,16 @@ zcio_stream *zcio_tcp_stream_from_fd_(zcio_socket fd, int timeout_ms);
  * ZCIO_OK or ZCIO_ERR_INVALID_ARG when the stream isn't a tcp socket stream. */
 int zcio_tcp_stream_set_timeout_(zcio_stream *s, int timeout_ms);
 
+/* Connect with explicit timeouts (tcp.c). connect_timeout_ms <= 0 -> default
+ * (15 s). io_timeout_ms > 0 presets the per-op transport timeout on the socket
+ * stream BEFORE any TLS wrap, so the handshake honors it too. `ctx` NULL ->
+ * plaintext, else TLS with `verify`. */
+struct zcio_tls_ctx;
+struct zcio_tcp_client;
+struct zcio_tcp_client *
+zcio_tcp_client_connect_opts_(const char *host, int port, struct zcio_tls_ctx *ctx,
+                              bool verify, int connect_timeout_ms, int io_timeout_ms);
+
 /* Set the transport timeout on a socket stream OR reach through a TLS overlay
  * to its underlying socket stream (so a wss session honors its recv/send
  * timeout). ZCIO_OK or ZCIO_ERR_INVALID_ARG. Implemented in tls.c. */
