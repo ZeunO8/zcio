@@ -6,6 +6,7 @@
 #include "zthread.h"
 #include "internal_port.h"
 #include <stdio.h>
+#include <time.h>
 
 typedef struct { int port; int ready; int requests; } srv_arg;
 
@@ -64,6 +65,81 @@ ZTEST(http_all_verbs_loopback) {
     zcio_http_response q = zcio_http_request("PATCH", url, &hdr, 1, "z", 1);
     check_ok(&q);
 
+    zthread_join(th);
+}
+
+/* Keep-alive server: answers one request with a Content-Length response but
+ * holds the connection OPEN for `hold_ms` before closing. The client must
+ * frame the response by Content-Length and return immediately — not wait for
+ * EOF (the pre-1.3.1 behavior, which stalled until the peer's idle close). */
+typedef struct { int port; int ready; int hold_ms; const char *response; } ka_arg;
+
+static void *keepalive_server(void *p) {
+    ka_arg *a = (ka_arg *)p;
+    zcio_tcp_server *srv = zcio_tcp_server_listen(a->port);
+    if (!srv) { a->ready = -1; return NULL; }
+    a->ready = 1;
+    size_t id = 0;
+    zcio_tcp_conn *conn = zcio_tcp_server_accept(srv, &id, 4000);
+    if (conn) {
+        zcio_stream *s = zcio_tcp_conn_stream(conn);
+        char req[2048];
+        zcio_read(s, req, sizeof req);
+        zcio_write_full(s, a->response, strlen(a->response));
+        zthread_sleep_ms(a->hold_ms);              /* keep-alive: no close yet */
+        zcio_tcp_server_close_client(srv, id);
+    }
+    zcio_tcp_server_free(srv);
+    return NULL;
+}
+
+ZTEST(http_keepalive_content_length) {
+    zcio_init();
+    ka_arg arg = { .port = ztest_free_port(), .ready = 0, .hold_ms = 8000,
+                   .response = kResponse };
+    zthread_t th;
+    zthread_start(&th, keepalive_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/", arg.port);
+
+    time_t t0 = time(NULL);
+    zcio_http_response g = zcio_http_get(url);
+    time_t elapsed = time(NULL) - t0;
+    check_ok(&g);
+    ZCHECK(elapsed < 4); /* returned on framing, not on the 8 s idle close */
+    zthread_join(th);
+}
+
+ZTEST(http_chunked_body) {
+    zcio_init();
+    ka_arg arg = { .port = ztest_free_port(), .ready = 0, .hold_ms = 8000,
+                   .response =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Transfer-Encoding: chunked\r\n"
+        "\r\n"
+        "5\r\nhello\r\n"
+        "6\r\n worof\r\n"      /* deliberately not 'world' — bytes are opaque */
+        "0\r\n\r\n" };
+    zthread_t th;
+    zthread_start(&th, keepalive_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/", arg.port);
+
+    time_t t0 = time(NULL);
+    zcio_http_response r = zcio_http_get(url);
+    time_t elapsed = time(NULL) - t0;
+    ZCHECK_EQ(r.status, 200);
+    ZCHECK(r.body != NULL && r.body_size == 11);
+    if (r.body) ZCHECK(memcmp(r.body, "hello worof", 11) == 0);
+    ZCHECK(elapsed < 4);
+    zcio_http_response_free(&r);
     zthread_join(th);
 }
 

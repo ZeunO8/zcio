@@ -45,6 +45,24 @@ ZCIO_API int           zcio_tcp_client_bytes_available(zcio_tcp_client *c);
 ZCIO_API ZCIO_NODISCARD zcio_tcp_server *zcio_tcp_server_listen(int port);
 ZCIO_API ZCIO_NODISCARD zcio_tcp_server *
 zcio_tcp_server_listen_tls(int port, zcio_tls_ctx *ctx, bool non_blocking);
+
+/* Host-scoped listeners: bind `host` instead of all interfaces. NULL, "" and
+ * "*" mean INADDR_ANY (same as the plain creators); anything else is a dotted
+ * quad or a name resolved to IPv4 — e.g. "localhost"/"127.0.0.1" for a
+ * loopback-only control plane. */
+ZCIO_API ZCIO_NODISCARD zcio_tcp_server *
+zcio_tcp_server_listen_host(const char *host, int port);
+ZCIO_API ZCIO_NODISCARD zcio_tcp_server *
+zcio_tcp_server_listen_host_tls(const char *host, int port,
+                                zcio_tls_ctx *ctx, bool non_blocking);
+
+/* Adopt an fd that is already bound and listening (e.g. inherited from a
+ * supervisor, or created with platform-specific socket options). On success
+ * the server takes ownership (the fd is set non-blocking and closed on free);
+ * on failure the fd remains owned by the caller. `listen_fd` holds an int fd
+ * on POSIX or a SOCKET on Windows. */
+ZCIO_API ZCIO_NODISCARD zcio_tcp_server *
+zcio_tcp_server_adopt(intptr_t listen_fd, zcio_tls_ctx *ctx, bool non_blocking);
 ZCIO_API void zcio_tcp_server_free(zcio_tcp_server *s);
 /* Accept one client. Returns a borrowed connection (owned by the server map)
  * and its id via out_id, or NULL on timeout/error. */

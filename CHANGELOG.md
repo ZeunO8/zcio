@@ -5,6 +5,35 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.1.0] - 2026-07-09
+
+### Added
+- **Host-scoped TCP listeners**: `zcio_tcp_server_listen_host` /
+  `zcio_tcp_server_listen_host_tls` bind a specific interface instead of
+  INADDR_ANY (NULL/`""`/`"*"` keep the bind-all behavior; names resolve to
+  IPv4, so `"localhost"` gives a loopback-only control plane).
+- **Listener fd adoption**: `zcio_tcp_server_adopt` wraps an already-bound,
+  already-listening socket (supervisor-inherited fds, custom socket options)
+  in a `zcio_tcp_server`; on failure the fd stays owned by the caller.
+
+### Fixed
+- **HTTP client vs keep-alive servers**: the client framed every response by
+  EOF, so any server that honored HTTP/1.1 keep-alive (i.e. nearly every
+  production origin) stalled the request until the peer's idle timeout
+  (~30 s) and then surfaced `http: read failed`. Requests now send
+  `Connection: close` (unless the caller supplies a `Connection` header), and
+  the reader stops as soon as a `Content-Length` body is complete or a
+  chunked body is terminated, falling back to EOF only when the response
+  carries no framing.
+- **`Transfer-Encoding: chunked` responses** are now de-chunked; previously
+  the raw chunk framing was returned in `body`.
+- **Implicit init in TLS context creators**: `zcio_tls_client_ctx` /
+  `zcio_tls_server_ctx*` now call `zcio_init()` themselves, so the first
+  `zcio_http_get("https://...")` or `zcio_ws_connect("wss://...")` of a
+  process no longer fails with `TLS context creation failed` when the
+  embedder never called `zcio_init()` (the documented contract — constructors
+  self-init — now holds on the TLS path too).
+
 ## [1.3.0.0] - 2026-07-09
 
 ### Added

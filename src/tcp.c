@@ -393,9 +393,43 @@ struct zcio_tcp_server {
     size_t        free_cap;
 };
 
+/* Wrap an already-listening socket in a server object (shared tail of the
+ * make/adopt paths). Takes ownership of fd. */
 static zcio_tcp_server *
-tcp_server_make(int port, zcio_tls_ctx *ctx, bool non_blocking) {
+tcp_server_wrap(zcio_socket fd, zcio_tls_ctx *ctx, bool non_blocking) {
+    zcio_tcp_server *s = (zcio_tcp_server *)zcio_xcalloc(1, sizeof *s);
+    if (!s) {
+        zcio_closesocket(fd);
+        zcio_fail_(ZCIO_ERR_NOMEM, "tcp_server: out of memory");
+        return NULL;
+    }
+    s->listen_fd = fd;
+    s->tls_ctx = ctx;
+    s->non_blocking = non_blocking;
+    s->next_id = 0;
+    return s;
+}
+
+static zcio_tcp_server *
+tcp_server_make(const char *host, int port, zcio_tls_ctx *ctx, bool non_blocking) {
     zcio_socket_startup();
+
+    /* Bind scope: NULL/""/"*" = all interfaces; anything else is a dotted
+     * quad or a name resolved to one (e.g. "localhost" -> 127.0.0.1). */
+    struct in_addr bind_addr;
+    bind_addr.s_addr = INADDR_ANY;
+    if (host && *host && strcmp(host, "*") != 0) {
+        if (inet_pton(AF_INET, host, &bind_addr) != 1) {
+            char *ip = zcio_resolve_ipv4(host);
+            int ok = ip && inet_pton(AF_INET, ip, &bind_addr) == 1;
+            free(ip);
+            if (!ok) {
+                zcio_fail_(ZCIO_ERR_DNS, "tcp_server: cannot resolve bind host '%s'", host);
+                return NULL;
+            }
+        }
+    }
+
     zcio_socket fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == ZCIO_INVALID_SOCKET) {
         zcio_fail_(ZCIO_ERR, "tcp_server: socket() failed");
@@ -416,11 +450,12 @@ tcp_server_make(int port, zcio_tls_ctx *ctx, bool non_blocking) {
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_addr = bind_addr;
     addr.sin_port = htons((unsigned short)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         zcio_closesocket(fd);
-        zcio_fail_(ZCIO_ERR, "tcp_server: bind(:%d) failed", port);
+        zcio_fail_(ZCIO_ERR, "tcp_server: bind(%s:%d) failed",
+                   (host && *host) ? host : "*", port);
         return NULL;
     }
     if (listen(fd, TCP_BACKLOG) != 0) {
@@ -429,26 +464,43 @@ tcp_server_make(int port, zcio_tls_ctx *ctx, bool non_blocking) {
         return NULL;
     }
 
-    zcio_tcp_server *s = (zcio_tcp_server *)zcio_xcalloc(1, sizeof *s);
-    if (!s) {
-        zcio_closesocket(fd);
-        zcio_fail_(ZCIO_ERR_NOMEM, "tcp_server: out of memory");
-        return NULL;
-    }
-    s->listen_fd = fd;
-    s->tls_ctx = ctx;
-    s->non_blocking = non_blocking;
-    s->next_id = 0;
-    return s;
+    return tcp_server_wrap(fd, ctx, non_blocking);
 }
 
 zcio_tcp_server *zcio_tcp_server_listen(int port) {
-    return tcp_server_make(port, NULL, true);
+    return tcp_server_make(NULL, port, NULL, true);
+}
+
+zcio_tcp_server *zcio_tcp_server_listen_host(const char *host, int port) {
+    return tcp_server_make(host, port, NULL, true);
 }
 
 zcio_tcp_server *
 zcio_tcp_server_listen_tls(int port, zcio_tls_ctx *ctx, bool non_blocking) {
-    return tcp_server_make(port, ctx, non_blocking);
+    return tcp_server_make(NULL, port, ctx, non_blocking);
+}
+
+zcio_tcp_server *
+zcio_tcp_server_listen_host_tls(const char *host, int port,
+                                zcio_tls_ctx *ctx, bool non_blocking) {
+    return tcp_server_make(host, port, ctx, non_blocking);
+}
+
+zcio_tcp_server *
+zcio_tcp_server_adopt(intptr_t listen_fd, zcio_tls_ctx *ctx, bool non_blocking) {
+    zcio_socket_startup();
+    zcio_socket fd = (zcio_socket)listen_fd;
+    if (fd == ZCIO_INVALID_SOCKET) {
+        zcio_fail_(ZCIO_ERR_INVALID_ARG, "tcp_server: adopt of invalid socket");
+        return NULL;
+    }
+    zcio_socket_nosigpipe(fd);
+    if (zcio_set_nonblocking(fd, true) != ZCIO_OK) {
+        /* NOT closed: an fd we could not adopt stays owned by the caller. */
+        zcio_fail_(ZCIO_ERR, "tcp_server: set non-blocking failed");
+        return NULL;
+    }
+    return tcp_server_wrap(fd, ctx, non_blocking);
 }
 
 void zcio_tcp_server_free(zcio_tcp_server *s) {

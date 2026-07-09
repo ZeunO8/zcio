@@ -33,6 +33,32 @@ ZTEST(tcp_loopback_roundtrip) {
     zcio_tcp_server_free(srv);
 }
 
+ZTEST(tcp_listen_host_scoped) {
+    zcio_init();
+    /* Loopback-scoped listener accepts loopback clients. */
+    zcio_tcp_server *srv = zcio_tcp_server_listen_host("127.0.0.1", TEST_TCP_PORT + 2);
+    ZCHECK(srv != NULL);
+    if (srv) {
+        zcio_tcp_client *cli = zcio_tcp_client_connect("127.0.0.1", TEST_TCP_PORT + 2);
+        ZCHECK(cli != NULL);
+        if (cli) {
+            size_t id = 0;
+            zcio_tcp_conn *conn = zcio_tcp_server_accept(srv, &id, 2000);
+            ZCHECK(conn != NULL);
+            zcio_tcp_client_free(cli);
+        }
+        zcio_tcp_server_free(srv);
+    }
+    /* "localhost" resolves; NULL/"*" keep the INADDR_ANY behavior. */
+    zcio_tcp_server *lo = zcio_tcp_server_listen_host("localhost", TEST_TCP_PORT + 3);
+    ZCHECK(lo != NULL);
+    zcio_tcp_server_free(lo);
+    /* Unresolvable bind host fails cleanly. */
+    zcio_tcp_server *bad =
+        zcio_tcp_server_listen_host("no.such.host.invalid.zcio.test.", TEST_TCP_PORT + 4);
+    ZCHECK(bad == NULL);
+}
+
 ZTEST(udp_loopback_roundtrip) {
     zcio_init();
     zcio_udp_server *srv = zcio_udp_server_bind(TEST_UDP_PORT);

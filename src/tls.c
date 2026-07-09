@@ -9,6 +9,7 @@
  * which zcio_init() calls to register itself via zcio_tls_set_backend().
  */
 #include "zcio/tls.h"
+#include "zcio/zcio.h"
 #include "internal.h"
 
 static const zcio_tls_backend *g_backend = NULL;
@@ -32,6 +33,7 @@ const char *zcio_tls_backend_name(void) {
 }
 
 zcio_tls_ctx *zcio_tls_client_ctx(const char *host) {
+    zcio_init(); /* ctx creators self-init so the default backend is registered */
     if (!g_backend || !g_backend->client_ctx) {
         zcio_fail_(ZCIO_ERR_UNSUPPORTED, "no TLS backend registered");
         return NULL;
@@ -40,6 +42,7 @@ zcio_tls_ctx *zcio_tls_client_ctx(const char *host) {
 }
 
 zcio_tls_ctx *zcio_tls_server_ctx(void) {
+    zcio_init();
     if (!g_backend || !g_backend->server_ctx) {
         zcio_fail_(ZCIO_ERR_UNSUPPORTED, "no TLS backend registered");
         return NULL;
@@ -48,6 +51,7 @@ zcio_tls_ctx *zcio_tls_server_ctx(void) {
 }
 
 zcio_tls_ctx *zcio_tls_server_ctx_files(const char *cert_path, const char *key_path) {
+    zcio_init();
     if (!g_backend || !g_backend->server_ctx_files) {
         zcio_fail_(ZCIO_ERR_UNSUPPORTED, "no TLS backend registered");
         return NULL;

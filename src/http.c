@@ -237,16 +237,28 @@ static int build_request(buf_t *out, const char *method, const zcio_url *u,
     if (buf_append_str(out, u->host) != ZCIO_OK) goto oom;
     if (buf_append_str(out, "\r\n") != ZCIO_OK) goto oom;
 
+    bool have_connection = false;
     for (size_t i = 0; i < header_count; i++) {
         if (!headers[i].key) continue;
         /* Skip any header whose key or value carries injection characters. */
         if (!header_token_ok(headers[i].key)) continue;
         if (headers[i].value && !header_token_ok(headers[i].value)) continue;
+        {
+            const char *k = headers[i].key, *ref = "connection";
+            size_t j = 0;
+            while (ref[j] && k[j] && tolower((unsigned char)k[j]) == ref[j]) j++;
+            if (!ref[j] && !k[j]) have_connection = true;
+        }
         if (buf_append_str(out, headers[i].key) != ZCIO_OK) goto oom;
         if (buf_append_str(out, ": ") != ZCIO_OK) goto oom;
         if (buf_append_str(out, headers[i].value ? headers[i].value : "") != ZCIO_OK) goto oom;
         if (buf_append_str(out, "\r\n") != ZCIO_OK) goto oom;
     }
+
+    /* One-shot client: ask the server to close so EOF delimits the response
+     * even when it carries neither Content-Length nor chunked framing. */
+    if (!have_connection)
+        if (buf_append_str(out, "Connection: close\r\n") != ZCIO_OK) goto oom;
 
     snprintf(clbuf, sizeof clbuf, "Content-Length: %zu\r\n\r\n", body_len);
     if (buf_append_str(out, clbuf) != ZCIO_OK) goto oom;
@@ -263,10 +275,54 @@ oom:
 
 /* --------------------------- response reading --------------------------- */
 
-/* Read the entire response (headers + body) off `s` into a single buffer. */
-static int read_all(zcio_stream *s, buf_t *out) {
+static char *find_header_value(const char *hdr_begin, const char *hdr_end, const char *key);
+
+/* Scan (and optionally decode) a chunked body at [p, end). Returns 1 when the
+ * terminating 0-chunk — including any trailers and the final blank line — is
+ * fully present, 0 when more data is needed, -1 on malformed framing. On
+ * success *decoded_len is the total payload size; when `dst` is non-NULL the
+ * payload is copied into it (caller sizes it from a prior scan). */
+static int chunked_scan(const char *p, const char *end, size_t *decoded_len, char *dst) {
+    size_t total = 0;
+    while (1) {
+        const char *line_end = memchr(p, '\n', (size_t)(end - p));
+        if (!line_end) return 0;
+        char *stop;
+        unsigned long long sz = strtoull(p, &stop, 16);
+        if (stop == p || stop > line_end) return -1;
+        p = line_end + 1;
+        if (sz == 0) {
+            /* Trailers (rare) run until a blank line. */
+            while (1) {
+                const char *te = memchr(p, '\n', (size_t)(end - p));
+                if (!te) return 0;
+                bool blank = (te == p) || (te == p + 1 && p[0] == '\r');
+                p = te + 1;
+                if (blank) { if (decoded_len) *decoded_len = total; return 1; }
+            }
+        }
+        if (sz > ZCIO_HTTP_MAX_RESPONSE || total + sz > ZCIO_HTTP_MAX_RESPONSE) return -1;
+        if ((size_t)(end - p) < (size_t)sz + 2) return 0; /* data + CRLF */
+        if (dst) memcpy(dst + total, p, (size_t)sz);
+        total += (size_t)sz;
+        p += sz;
+        if (p[0] != '\r' || p[1] != '\n') return -1;
+        p += 2;
+    }
+}
+
+/* Read one response (headers + body) off `s` into a single buffer. Framing:
+ * once the header block is complete, stop as soon as a Content-Length body is
+ * fully buffered or a chunked body is terminated; otherwise (no framing info)
+ * read to EOF — we requested Connection: close, so EOF delimits the message
+ * even against keep-alive servers. */
+static int read_response(zcio_stream *s, buf_t *out) {
     memset(out, 0, sizeof *out);
     char chunk[8192];
+    bool   hdr_done = false;
+    size_t body_off = 0;              /* offset of body start in out->data */
+    long long content_len = -1;       /* -1 = unknown */
+    bool   chunked = false;
     for (;;) {
         int64_t r = zcio_read(s, chunk, sizeof chunk);
         if (r < 0) {
@@ -285,6 +341,39 @@ static int read_all(zcio_stream *s, buf_t *out) {
             free(out->data);
             memset(out, 0, sizeof *out);
             return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory reading response");
+        }
+
+        if (!hdr_done && out->len >= 4) {
+            for (size_t i = 0; i + 3 < out->len; i++) {
+                if (out->data[i] == '\r' && out->data[i+1] == '\n' &&
+                    out->data[i+2] == '\r' && out->data[i+3] == '\n') {
+                    hdr_done = true;
+                    body_off = i + 4;
+                    char *cl = find_header_value(out->data, out->data + i, "Content-Length");
+                    if (cl) { content_len = atoll(cl); free(cl); }
+                    char *te = find_header_value(out->data, out->data + i, "Transfer-Encoding");
+                    if (te) {
+                        for (char *c = te; *c; c++) *c = (char)tolower((unsigned char)*c);
+                        chunked = strstr(te, "chunked") != NULL;
+                        free(te);
+                    }
+                    break;
+                }
+            }
+        }
+        if (hdr_done) {
+            size_t body_avail = out->len - body_off;
+            if (chunked) {
+                int c = chunked_scan(out->data + body_off, out->data + out->len, NULL, NULL);
+                if (c == 1) break;
+                if (c < 0) {
+                    free(out->data);
+                    memset(out, 0, sizeof *out);
+                    return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: malformed chunked body");
+                }
+            } else if (content_len >= 0 && body_avail >= (size_t)content_len) {
+                break;
+            }
         }
     }
     return ZCIO_OK;
@@ -449,22 +538,47 @@ static int parse_response(const buf_t *raw, zcio_http_response *resp, char **loc
     if (location_out)
         *location_out = find_header_value(hdr_begin, sep, "Location");
 
-    /* Body: prefer Content-Length, else everything to EOF. */
+    /* Body: de-chunk Transfer-Encoding: chunked, else prefer Content-Length,
+     * else everything to EOF. */
     {
-        char *cl = find_header_value(hdr_begin, sep, "Content-Length");
         size_t avail = (size_t)((data + len) - body_begin);
-        size_t body_len = avail;
-        if (cl) {
-            long long n = atoll(cl);
-            free(cl);
-            if (n >= 0 && (size_t)n < avail) body_len = (size_t)n;
+        bool chunked = false;
+        char *te = find_header_value(hdr_begin, sep, "Transfer-Encoding");
+        if (te) {
+            for (char *c = te; *c; c++) *c = (char)tolower((unsigned char)*c);
+            chunked = strstr(te, "chunked") != NULL;
+            free(te);
         }
-        char *body = (char *)zcio_xmalloc(body_len + 1);
-        if (!body) goto oom;
-        memcpy(body, body_begin, body_len);
-        body[body_len] = '\0';
-        resp->body = body;
-        resp->body_size = body_len;
+        if (chunked) {
+            size_t decoded = 0;
+            int c = chunked_scan(body_begin, body_begin + avail, &decoded, NULL);
+            if (c != 1) {
+                zcio_http_response_free(resp);
+                memset(resp, 0, sizeof *resp);
+                if (location_out) { free(*location_out); *location_out = NULL; }
+                return zcio_fail_(ZCIO_ERR_PROTOCOL, "http: incomplete chunked body");
+            }
+            char *body = (char *)zcio_xmalloc(decoded + 1);
+            if (!body) goto oom;
+            (void)chunked_scan(body_begin, body_begin + avail, &decoded, body);
+            body[decoded] = '\0';
+            resp->body = body;
+            resp->body_size = decoded;
+        } else {
+            char *cl = find_header_value(hdr_begin, sep, "Content-Length");
+            size_t body_len = avail;
+            if (cl) {
+                long long n = atoll(cl);
+                free(cl);
+                if (n >= 0 && (size_t)n < avail) body_len = (size_t)n;
+            }
+            char *body = (char *)zcio_xmalloc(body_len + 1);
+            if (!body) goto oom;
+            memcpy(body, body_begin, body_len);
+            body[body_len] = '\0';
+            resp->body = body;
+            resp->body_size = body_len;
+        }
     }
 
     return ZCIO_OK;
@@ -558,7 +672,7 @@ static int do_exchange(const char *method, const char *url,
 
     /* Read the full response, then parse. */
     buf_t raw;
-    int rr = read_all(s, &raw);
+    int rr = read_response(s, &raw);
     zcio_tcp_client_free(client);
     if (tls) zcio_tls_ctx_free(tls);
     url_free(&u);
