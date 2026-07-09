@@ -4,6 +4,19 @@
 # CTest invokes this as:  adb_runner.sh <host-path-to-test-exe> [args...]
 # (CMAKE_CROSSCOMPILING_EMULATOR prefixes every registered test command.)
 #
+# If no device is online, the launcher provisions one before dispatching:
+#   1. an already-online device/emulator is used as-is;
+#   2. otherwise the best available AVD is booted headless — ZCIO_ANDROID_AVD
+#      names a preferred AVD, else the first one `emulator -list-avds` reports;
+#   3. if no AVD exists, one is created ("zcio-test") with avdmanager, first
+#      installing @ZCIO_ANDROID_DEFAULT_IMAGE_API@ for the host architecture
+#      via sdkmanager if needed (one-time, large download).
+# Set ZCIO_NO_AUTOBOOT=1 to disable all of this and fail fast instead (CI rigs
+# that manage devices themselves). With several devices attached, export
+# ANDROID_SERIAL to choose one (adb's own convention). ZCIO_BOOT_TIMEOUT
+# bounds the boot wait in seconds [600]. Concurrent launchers (ctest -j)
+# serialize the boot behind a lock; only the first one pays for it.
+#
 # The executable is pushed to @ZCIO_ANDROID_DEVICE_DIR@ and run there, so
 # tests may read/write files in their working directory. Additional runtime
 # files (shared-library fixtures, data files) can be staged by setting
@@ -16,6 +29,143 @@ set -eu
 
 ADB="@ZCIO_ADB@"
 DEV_DIR="@ZCIO_ANDROID_DEVICE_DIR@"
+BOOT_TIMEOUT="${ZCIO_BOOT_TIMEOUT:-600}"
+LOCK_DIR="${TMPDIR:-/tmp}/zcio-android-boot.lock"
+
+log() { echo "zcio-adb-runner: $*" >&2; }
+
+device_ready() {
+    [ "$("$ADB" get-state 2>/dev/null || true)" = "device" ]
+}
+
+boot_completed() {
+    [ "$("$ADB" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]
+}
+
+# SDK root: adb normally lives in <sdk>/platform-tools; fall back to the
+# conventional env vars and install location for repackaged adb binaries.
+find_sdk() {
+    for d in "$(dirname "$(dirname "$ADB")")" \
+             "${ANDROID_SDK_ROOT:-}" "${ANDROID_HOME:-}" \
+             "$HOME/Library/Android/sdk" "$HOME/Android/Sdk"; do
+        if [ -n "$d" ] && [ -x "$d/emulator/emulator" ]; then
+            printf '%s\n' "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# sdkmanager/avdmanager are JVM launchers; find a usable JAVA_HOME, preferring
+# an explicit one, then Android Studio's bundled JBR, then any java on PATH.
+find_java() {
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then return 0; fi
+    for j in "/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+             "$HOME/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+             "/opt/android-studio/jbr" \
+             "$HOME/android-studio/jbr"; do
+        if [ -x "$j/bin/java" ]; then
+            JAVA_HOME="$j"; export JAVA_HOME
+            return 0
+        fi
+    done
+    command -v java > /dev/null 2>&1
+}
+
+# Create an AVD named zcio-test, installing a system image first if the SDK
+# has none for it. Prints the AVD name on success.
+create_avd() {
+    sdk="$1"
+    sdkm="$sdk/cmdline-tools/latest/bin/sdkmanager"
+    avdm="$sdk/cmdline-tools/latest/bin/avdmanager"
+    if [ ! -x "$sdkm" ] || [ ! -x "$avdm" ]; then
+        log "no AVD exists and cmdline-tools are not installed under $sdk"
+        log "install 'cmdline-tools;latest' (Android Studio SDK Manager) and re-run"
+        return 1
+    fi
+    if ! find_java; then
+        log "no Java runtime for sdkmanager/avdmanager — set JAVA_HOME"
+        return 1
+    fi
+
+    case "$(uname -m)" in
+        arm64|aarch64) abi=arm64-v8a ;;
+        *)             abi=x86_64 ;;
+    esac
+    img="${ZCIO_ANDROID_SYSTEM_IMAGE:-system-images;@ZCIO_ANDROID_DEFAULT_IMAGE_API@;google_apis;$abi}"
+    img_dir="$sdk/$(printf '%s' "$img" | tr ';' '/')"
+
+    if [ ! -d "$img_dir" ]; then
+        log "installing $img (one-time download, may take several minutes)..."
+        yes | "$sdkm" --licenses > /dev/null 2>&1 || true
+        yes | "$sdkm" "$img" > /dev/null
+    fi
+
+    log "creating AVD 'zcio-test' from $img"
+    echo no | "$avdm" create avd -n zcio-test -k "$img" > /dev/null
+    echo zcio-test
+}
+
+ensure_device() {
+    device_ready && return 0
+    if [ -n "${ZCIO_NO_AUTOBOOT:-}" ]; then
+        log "no device online and ZCIO_NO_AUTOBOOT is set"
+        return 1
+    fi
+
+    # One boot at a time: whoever takes the lock provisions; everyone else
+    # waits for the device to come up (or for the lock to free after failure).
+    waited=0
+    until mkdir "$LOCK_DIR" 2>/dev/null; do
+        device_ready && return 0
+        if [ "$waited" -ge "$BOOT_TIMEOUT" ]; then
+            log "timed out waiting for another launcher's boot"
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+
+    if device_ready; then
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+        trap - EXIT
+        return 0
+    fi
+
+    if ! sdk="$(find_sdk)"; then
+        log "cannot locate an Android SDK with an emulator (set ANDROID_SDK_ROOT)"
+        return 1
+    fi
+
+    avd="${ZCIO_ANDROID_AVD:-}"
+    if [ -z "$avd" ]; then
+        avd="$("$sdk/emulator/emulator" -list-avds 2>/dev/null | grep -v '^$' | head -n 1 || true)"
+    fi
+    if [ -z "$avd" ]; then
+        avd="$(create_avd "$sdk")"
+    fi
+
+    log "booting AVD '$avd' headless (override with ZCIO_ANDROID_AVD)..."
+    nohup "$sdk/emulator/emulator" -avd "$avd" -no-window -no-audio -no-boot-anim \
+        > /dev/null 2>&1 &
+
+    waited=0
+    until device_ready && boot_completed; do
+        if [ "$waited" -ge "$BOOT_TIMEOUT" ]; then
+            log "AVD '$avd' did not finish booting within ${BOOT_TIMEOUT}s"
+            return 1
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    log "AVD '$avd' is up"
+
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    trap - EXIT
+}
+
+ensure_device
 
 exe="$1"; shift
 name="$(basename "$exe")"

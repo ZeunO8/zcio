@@ -4,11 +4,118 @@
 # CTest invokes this as:  simctl_runner.sh <host-path-to-test-exe> [args...]
 # (CMAKE_CROSSCOMPILING_EMULATOR prefixes every registered test command.)
 #
+# If no simulator is booted, the launcher provisions one before dispatching:
+#   1. with ZCIO_SIM_DEVICE set to a UDID, that device is booted if needed;
+#   2. otherwise the best available device is chosen — iPhones first, newest
+#      iOS runtime first — and booted (simctl bootstatus -b waits for it);
+#   3. if the runtime ships no devices at all, one ("zcio-test") is created
+#      from the newest iPhone device type + newest installed iOS runtime; if
+#      no iOS runtime is installed, `xcodebuild -downloadPlatform iOS` is
+#      attempted once (multi-GB download) before giving up.
+# Set ZCIO_NO_AUTOBOOT=1 to disable all of this and fail fast instead.
+#
 # simctl spawn runs a simulator-arch binary inside the booted simulator
 # runtime; the simulator shares the host filesystem, so host paths (the
-# executable, /tmp scratch files, fixture dylibs) work unchanged. The target
-# device defaults to "booted" — boot one first with `xcrun simctl boot <udid>`
-# — and can be overridden per run with ZCIO_SIM_DEVICE=<udid>.
+# executable, /tmp scratch files, fixture dylibs) work unchanged.
 set -eu
 
-exec xcrun simctl spawn "${ZCIO_SIM_DEVICE:-@ZCIO_SIM_DEVICE@}" "$@"
+DEVICE="${ZCIO_SIM_DEVICE:-@ZCIO_SIM_DEVICE@}"
+
+log() { echo "zcio-simctl-runner: $*" >&2; }
+
+any_booted() {
+    xcrun simctl list devices booted 2>/dev/null | grep -q "(Booted)"
+}
+
+# Print the UDID of the best device to use, creating one if necessary.
+# Exit 3 means "no iOS runtime installed" (caller may download and retry).
+pick_or_create() {
+    /usr/bin/python3 - <<'PY'
+import json, subprocess, sys
+
+def sc(*args):
+    return json.loads(subprocess.run(["xcrun", "simctl", "list", "-j", *args],
+                                     capture_output=True, text=True,
+                                     check=True).stdout)
+
+def vkey(s):
+    return tuple(int(p) for p in s.replace("-", ".").split(".") if p.isdigit())
+
+# Best existing device: iPhones before other families, newest runtime first.
+best = None
+for rt, devs in sc("devices", "available")["devices"].items():
+    if ".iOS-" not in rt:
+        continue
+    ver = vkey(rt.rsplit(".iOS-", 1)[1])
+    for d in devs:
+        if not d.get("isAvailable"):
+            continue
+        rank = (0 if d["name"].startswith("iPhone") else 1,
+                tuple(-v for v in ver))
+        if best is None or rank < best[0]:
+            best = (rank, d["udid"])
+if best:
+    print(best[1])
+    sys.exit(0)
+
+# None exist: create one from the newest iOS runtime and the newest iPhone
+# type IT supports. supportedDeviceTypes is ordered newest-first and only
+# lists compatible types; the global devicetypes fallback ranks by numeric
+# minRuntimeVersion (newer hardware requires a newer floor). Matching on the
+# name skips iPods, whose productFamily is also "iPhone".
+runtimes = [r for r in sc("runtimes")["runtimes"]
+            if r.get("platform") == "iOS" and r.get("isAvailable")]
+if not runtimes:
+    sys.exit(3)
+runtime = max(runtimes, key=lambda r: vkey(r.get("version", "0")))
+cands = [t for t in runtime.get("supportedDeviceTypes", [])
+         if t.get("name", "").startswith("iPhone")]
+if cands:
+    dtype = cands[0]
+else:
+    cands = [t for t in sc("devicetypes")["devicetypes"]
+             if t.get("name", "").startswith("iPhone")]
+    if not cands:
+        sys.exit(4)
+    dtype = max(cands, key=lambda t: t.get("minRuntimeVersion", 0))
+created = subprocess.run(["xcrun", "simctl", "create", "zcio-test",
+                          dtype["identifier"], runtime["identifier"]],
+                         capture_output=True, text=True, check=True)
+print(created.stdout.strip())
+PY
+}
+
+ensure_device() {
+    if [ "$DEVICE" != "booted" ]; then
+        # Explicit device: boot it if needed (idempotent when already booted).
+        if [ -z "${ZCIO_NO_AUTOBOOT:-}" ]; then
+            xcrun simctl bootstatus "$DEVICE" -b > /dev/null
+        fi
+        return 0
+    fi
+
+    any_booted && return 0
+    if [ -n "${ZCIO_NO_AUTOBOOT:-}" ]; then
+        log "no simulator booted and ZCIO_NO_AUTOBOOT is set"
+        return 1
+    fi
+
+    rc=0
+    udid="$(pick_or_create)" || rc=$?
+    if [ "$rc" = 3 ]; then
+        log "no iOS simulator runtime installed — downloading one (multi-GB, one-time)..."
+        xcodebuild -downloadPlatform iOS
+        udid="$(pick_or_create)"
+    elif [ "$rc" != 0 ]; then
+        log "could not choose or create a simulator device (rc=$rc)"
+        return "$rc"
+    fi
+
+    log "booting simulator $udid (override with ZCIO_SIM_DEVICE)..."
+    xcrun simctl bootstatus "$udid" -b > /dev/null
+    log "simulator is up"
+}
+
+ensure_device
+
+exec xcrun simctl spawn "$DEVICE" "$@"

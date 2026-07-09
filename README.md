@@ -164,18 +164,26 @@ cmake --preset android-arm64  && cmake --build --preset android-arm64
 Cross-compiled binaries can't execute on the build host, so passing
 `-DZCIO_BUILD_TESTS=ON` on a cross build wires `CMAKE_CROSSCOMPILING_EMULATOR`
 to a launcher (`cmake/ZcioMobileTest.cmake`): `adb` push-and-run for Android
-(emulator or USB device), `xcrun simctl spawn` into the booted simulator for
-iOS. A plain `ctest` then behaves exactly like a host run — TLS/archive tests
+(emulator or USB device), `xcrun simctl spawn` into the simulator for iOS. A
+plain `ctest` then behaves exactly like a host run — TLS/archive tests
 self-skip on the dependency-free mobile builds.
 
+No device needs to be running: if nothing is online the launcher boots the
+best available emulator/simulator itself (Android: `ZCIO_ANDROID_AVD` or the
+first AVD; iOS: iPhones first, newest runtime first), and if none exists it
+creates one with the platform CLI — `sdkmanager`/`avdmanager` on Android
+(installing a system image on first use), `simctl create` on iOS (downloading
+the platform runtime as a last resort). Set `ZCIO_NO_AUTOBOOT=1` to fail fast
+instead (e.g. CI that manages devices externally); `ZCIO_BOOT_TIMEOUT` bounds
+the Android boot wait.
+
 ```sh
-# Android: boot an emulator (or attach a device), then
+# Android
 cmake --preset android-arm64 -DZCIO_BUILD_TESTS=ON
 cmake --build --preset android-arm64
 ctest --test-dir build/android-arm64 --output-on-failure
 
-# iOS simulator: boot one, then
-xcrun simctl boot "iPhone 17 Pro"
+# iOS simulator
 cmake --preset ios-simulator -DZCIO_BUILD_TESTS=ON
 cmake --build --preset ios-simulator
 ctest --test-dir build/ios-simulator --output-on-failure

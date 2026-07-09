@@ -24,10 +24,19 @@
 # colon-separated list of host paths; the launcher pushes each beside the
 # executable before running it.
 #
+# Both launchers auto-provision: if no device is online/booted at test time,
+# the best available emulator/simulator is booted, and if none exists one is
+# created with the OS provider CLI (sdkmanager/avdmanager; simctl create).
+# Runtime env knobs: ZCIO_NO_AUTOBOOT=1 (fail fast instead), ZCIO_ANDROID_AVD
+# (preferred AVD), ZCIO_ANDROID_SYSTEM_IMAGE (image for a created AVD),
+# ZCIO_SIM_DEVICE (UDID), ZCIO_BOOT_TIMEOUT (seconds, Android [600]).
+#
 # Cache knobs:
 #   ZCIO_ADB                — adb executable (auto-detected from ANDROID_SDK_ROOT/
 #                             ANDROID_HOME/~/Library/Android/sdk or PATH)
 #   ZCIO_ANDROID_DEVICE_DIR — on-device staging dir [/data/local/tmp/zcio-tests]
+#   ZCIO_ANDROID_DEFAULT_IMAGE_API — system-image API used when the launcher
+#                             must create an AVD from scratch [android-36]
 #   ZCIO_SIM_DEVICE         — simulator UDID for simctl spawn [booted]
 
 function(zcio_enable_mobile_testing)
@@ -47,6 +56,8 @@ function(zcio_enable_mobile_testing)
 
         set(ZCIO_ANDROID_DEVICE_DIR "/data/local/tmp/zcio-tests"
             CACHE STRING "On-device staging directory for pushed test binaries")
+        set(ZCIO_ANDROID_DEFAULT_IMAGE_API "android-36"
+            CACHE STRING "System-image API level for a launcher-created AVD")
 
         set(_zcio_runner "${CMAKE_BINARY_DIR}/zcio-adb-runner.sh")
         configure_file("${CMAKE_CURRENT_FUNCTION_LIST_DIR}/adb_runner.sh.in"
