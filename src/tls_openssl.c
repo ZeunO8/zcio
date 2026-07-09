@@ -61,6 +61,14 @@ static void tls_set_ossl_error(const char *what) {
 /* Each SSL gets a BIO whose "app data" is the underlying plaintext stream. */
 static BIO_METHOD *g_bio_method = NULL;
 
+/* Last transient (retryable) error the BIO saw from the plaintext stream on
+ * THIS thread: ZCIO_ERR_TIMEOUT or ZCIO_ERR_WOULDBLOCK, 0 = none. SSL_read/
+ * SSL_write report both as WANT_READ/WANT_WRITE (or SYSCALL), so this is how
+ * tls_strm_read/write tell a per-op read timeout apart from a renegotiation
+ * retry — a timeout must surface as ZCIO_ERR_TIMEOUT, not loop or become a
+ * hard TLS error. */
+static ZCIO_THREAD int g_bio_transient_err;
+
 static int zcio_bio_write(BIO *b, const char *data, int len) {
     zcio_stream *plain = (zcio_stream *)BIO_get_data(b);
     BIO_clear_retry_flags(b);
@@ -68,7 +76,8 @@ static int zcio_bio_write(BIO *b, const char *data, int len) {
     if (len == 0) return 0;
     int64_t w = zcio_write(plain, data, (size_t)len);
     if (w > 0) return (int)w;
-    if (w == ZCIO_ERR_WOULDBLOCK) {
+    if (w == ZCIO_ERR_WOULDBLOCK || w == ZCIO_ERR_TIMEOUT) {
+        g_bio_transient_err = (int)w;
         BIO_set_retry_write(b);
         return -1;
     }
@@ -84,7 +93,8 @@ static int zcio_bio_read(BIO *b, char *data, int len) {
     int64_t r = zcio_read(plain, data, (size_t)len);
     if (r > 0) return (int)r;
     if (r == 0) return 0; /* EOF: SSL turns this into a clean/dirty shutdown */
-    if (r == ZCIO_ERR_WOULDBLOCK) {
+    if (r == ZCIO_ERR_WOULDBLOCK || r == ZCIO_ERR_TIMEOUT) {
+        g_bio_transient_err = (int)r;
         BIO_set_retry_read(b);
         return -1;
     }
@@ -165,19 +175,23 @@ static int64_t tls_strm_read(void *vctx, void *dst, size_t n) {
     if (n == 0) return 0;
     if (n > INT_MAX) n = INT_MAX;
     for (;;) {
+        g_bio_transient_err = 0;
         int r = SSL_read(t->ssl, dst, (int)n);
         if (r > 0) return r;
         int err = SSL_get_error(t->ssl, r);
         switch (err) {
             case SSL_ERROR_WANT_READ:
             case SSL_ERROR_WANT_WRITE:
-                /* Underlying BIO is blocking unless the transport returned
-                 * WOULDBLOCK; in that case propagate. Loop to retry otherwise. */
+                /* A transient transport condition (per-op timeout, would-
+                 * block) propagates as-is; otherwise the underlying BIO is
+                 * blocking and the retry flag means renegotiation — loop. */
+                if (g_bio_transient_err) return g_bio_transient_err;
                 if (BIO_should_retry(t->bio)) continue;
                 return ZCIO_ERR_WOULDBLOCK;
             case SSL_ERROR_ZERO_RETURN:
                 return 0; /* clean TLS close_notify */
             case SSL_ERROR_SYSCALL:
+                if (g_bio_transient_err) return g_bio_transient_err;
                 if (r == 0) return 0; /* EOF without close_notify */
                 return zcio_fail_(ZCIO_ERR_TLS, "SSL_read: transport error");
             default:
@@ -192,17 +206,20 @@ static int64_t tls_strm_write(void *vctx, const void *src, size_t n) {
     if (n == 0) return 0;
     if (n > INT_MAX) n = INT_MAX;
     for (;;) {
+        g_bio_transient_err = 0;
         int w = SSL_write(t->ssl, src, (int)n);
         if (w > 0) return w;
         int err = SSL_get_error(t->ssl, w);
         switch (err) {
             case SSL_ERROR_WANT_READ:
             case SSL_ERROR_WANT_WRITE:
+                if (g_bio_transient_err) return g_bio_transient_err;
                 if (BIO_should_retry(t->bio)) continue;
                 return ZCIO_ERR_WOULDBLOCK;
             case SSL_ERROR_ZERO_RETURN:
                 return zcio_fail_(ZCIO_ERR_EOF, "SSL_write: connection closed");
             case SSL_ERROR_SYSCALL:
+                if (g_bio_transient_err) return g_bio_transient_err;
                 return zcio_fail_(ZCIO_ERR_TLS, "SSL_write: transport error");
             default:
                 tls_set_ossl_error("SSL_write");

@@ -5,6 +5,19 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.2.0] - 2026-07-09
+
+### Fixed
+- **TLS per-op read timeout was fatal**: a timed-out `zcio_read` on a TLS
+  stream (e.g. `zcio_ws_recv` with a short timeout on a `wss://` session, the
+  idiomatic service-loop pattern) surfaced as a hard `ZCIO_ERR_TLS`
+  ("SSL_read: transport error") and killed the session, because the custom
+  BIO only marked `ZCIO_ERR_WOULDBLOCK` — not `ZCIO_ERR_TIMEOUT` — as
+  retryable, so OpenSSL saw a syscall failure. Timeouts (and would-blocks)
+  now propagate out of `SSL_read`/`SSL_write` as `ZCIO_ERR_TIMEOUT` /
+  `ZCIO_ERR_WOULDBLOCK`, leaving the session usable; regression covered by
+  `tls_read_timeout_transient` (test_tls).
+
 ## [1.3.1.0] - 2026-07-09
 
 ### Added
