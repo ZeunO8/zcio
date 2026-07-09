@@ -219,4 +219,42 @@ ZTEST(http_server_bind_host) {
     ZCHECK(zcio_http_server_start(&cfg, handler, NULL) == NULL);
 }
 
+/* reuse_addr: a fixed-port server that serves a request (forcing a real
+ * accepted connection, so its close can leave the port TIME_WAIT-ish) must be
+ * able to stop, free, and restart on the SAME port immediately — twice in a
+ * row — when reuse_addr is set. This is the restart-tolerance a long-running
+ * fixed-port service (hostd, zhs) needs from a supervisor bounce. */
+ZTEST(http_server_reuse_addr_fast_restart) {
+    zcio_init();
+    int port = ztest_free_port();
+
+    for (int round = 0; round < 2; round++) {
+        zcio_http_server_config cfg;
+        memset(&cfg, 0, sizeof cfg);
+        cfg.port = port;
+        cfg.bind_host = "127.0.0.1";
+        cfg.reuse_addr = true;
+        cfg.drain_timeout_ms = 500;
+
+        zcio_http_server *srv = zcio_http_server_start(&cfg, handler, NULL);
+        ZCHECK(srv != NULL);
+        if (!srv) return;
+
+        zthread_t th;
+        zthread_start(&th, run_thread, srv);
+        zthread_sleep_ms(50);
+
+        char url[64];
+        snprintf(url, sizeof url, "http://127.0.0.1:%d/ping", port);
+        zcio_http_header close_hdr = { .key = "Connection", .value = "close" };
+        zcio_http_response r = zcio_http_request("GET", url, &close_hdr, 1, NULL, 0);
+        ZCHECK_EQ(r.status, 200);
+        zcio_http_response_free(&r);
+
+        zcio_http_server_stop(srv);
+        zthread_join(th);
+        zcio_http_server_free(srv);
+    }
+}
+
 ZTEST_MAIN()

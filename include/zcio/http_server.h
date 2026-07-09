@@ -87,6 +87,13 @@ typedef struct zcio_http_server_config {
     bool        hsts;          /* add Strict-Transport-Security on TLS resps  */
     const char *host;          /* public hostname for redirects; default: the
                                 * request's own Host header                   */
+    bool        reuse_addr;    /* SO_REUSEADDR on the listener(s) [false].
+                                * Off by default so an ephemeral bind (port=0)
+                                * gets a fresh port every run; a fixed-port
+                                * long-running service that a supervisor
+                                * restarts should set this to avoid "address
+                                * already in use" during the post-close
+                                * TIME_WAIT window.                           */
 
     /* --- limits (0 = default) ------------------------------------------ */
     size_t   max_header_bytes;      /* request line + all headers   [32 KiB]  */

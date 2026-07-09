@@ -5,6 +5,17 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.5.0] - 2026-07-09
+
+### Added
+- **HTTP server `reuse_addr`**: `zcio_http_server_config.reuse_addr` opts a
+  listener into `SO_REUSEADDR` (default off, preserving the existing
+  fresh-ephemeral-port behavior for `port=0`). A fixed-port long-running
+  service that a supervisor restarts (or that self-updates and re-execs)
+  needs this to avoid "address already in use" during the post-close
+  TIME_WAIT window. Regression: `http_server_reuse_addr_fast_restart`
+  (two full start/serve/stop/free cycles on the same fixed port).
+
 ## [1.3.4.0] - 2026-07-09
 
 ### Added

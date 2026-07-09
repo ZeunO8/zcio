@@ -573,11 +573,15 @@ static void server_remove_dead(zcio_http_server *srv) {
  *  Listeners / accept
  * ========================================================================= */
 
-/* Create a non-blocking TCP listener. Deliberately no SO_REUSEADDR: matches the
- * server's documented behavior (fresh ephemeral ports across restarts).
+/* Create a non-blocking TCP listener. SO_REUSEADDR is opt-in (`reuse`):
+ * default off, matching the server's documented behavior (fresh ephemeral
+ * ports across restarts) for the common ephemeral-port (port=0) case; a
+ * fixed-port long-running service that gets restarted (a supervisor bounce,
+ * a self-update) should set it to avoid "address already in use" during the
+ * post-close TIME_WAIT window.
  * bind_host: NULL/""/"*" bind all interfaces; else a dotted quad or a name
  * resolved to IPv4 (same convention as zcio_tcp_server_listen_host). */
-static zcio_socket make_listener(const char *bind_host, int port, int *out_port) {
+static zcio_socket make_listener(const char *bind_host, int port, bool reuse, int *out_port) {
     zcio_socket_startup();
 
     struct sockaddr_in addr;
@@ -603,6 +607,10 @@ static zcio_socket make_listener(const char *bind_host, int port, int *out_port)
         return ZCIO_INVALID_SOCKET;
     }
     zcio_socket_nosigpipe(fd);
+    if (reuse) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&one, sizeof one);
+    }
     if (zcio_set_nonblocking(fd, true) != ZCIO_OK) {
         zcio_closesocket(fd);
         zcio_fail_(ZCIO_ERR, "http: set non-blocking failed");
@@ -949,11 +957,11 @@ zcio_http_server *zcio_http_server_start(const zcio_http_server_config *cfg,
 
     if (make_wake(s) != ZCIO_OK) { zcio_fail_(ZCIO_ERR, "start: wake pipe failed"); goto fail; }
 
-    s->listen_fd = make_listener(s->cfg.bind_host, s->cfg.port, &s->bound_port);
+    s->listen_fd = make_listener(s->cfg.bind_host, s->cfg.port, s->cfg.reuse_addr, &s->bound_port);
     if (s->listen_fd == ZCIO_INVALID_SOCKET) goto fail;
 
     if (s->cfg.redirect_port > 0) {
-        s->redirect_fd = make_listener(s->cfg.bind_host, s->cfg.redirect_port, NULL);
+        s->redirect_fd = make_listener(s->cfg.bind_host, s->cfg.redirect_port, s->cfg.reuse_addr, NULL);
         if (s->redirect_fd == ZCIO_INVALID_SOCKET) goto fail;
     }
 
