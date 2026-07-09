@@ -5,6 +5,23 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.0.0] - 2026-07-09
+
+### Added
+- **Device auto-provisioning in the mobile test launchers**: `ctest` no longer
+  requires a running emulator/simulator. If no device is online, the Android
+  launcher boots the best available AVD (`ZCIO_ANDROID_AVD` to pick one) and,
+  when none exists, creates `zcio-test` via `avdmanager` — installing a
+  system image with `sdkmanager` on first use (Java auto-detected, including
+  Android Studio's bundled JBR). The iOS launcher boots the best available
+  device (iPhones first, newest runtime first) via `simctl bootstatus -b`
+  and, when none exists, creates one from the newest supported iPhone type
+  with `simctl create`, downloading the platform runtime as a last resort.
+  Concurrent launchers (`ctest -j`) serialize the boot behind a lock. Opt out
+  with `ZCIO_NO_AUTOBOOT=1`; `ZCIO_BOOT_TIMEOUT` bounds the Android wait
+  [600 s]; `ZCIO_ANDROID_DEFAULT_IMAGE_API` (cache) selects the image API for
+  created AVDs [android-36].
+
 ## [1.2.0.0] - 2026-07-09
 
 ### Added
