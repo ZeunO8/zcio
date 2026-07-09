@@ -797,6 +797,179 @@ static int resolve_redirect(const zcio_url *prev, const char *location, char **o
     return ZCIO_OK;
 }
 
+/* ---------------------------- keep-alive session -------------------------- */
+
+struct zcio_http_session {
+    zcio_url       origin;   /* scheme/secure/host/port fixed at create; path unused */
+    zcio_tls_ctx  *tls;      /* NULL for plaintext; owned, reused across reconnects */
+    zcio_tcp_client *client; /* NULL when not currently connected */
+};
+
+static int session_connect(zcio_http_session *sess, int connect_timeout_ms, int io_timeout_ms) {
+    if (sess->client) return ZCIO_OK;
+    sess->client = zcio_tcp_client_connect_opts_(sess->origin.host, sess->origin.port,
+                                                 sess->tls, true, connect_timeout_ms, io_timeout_ms);
+    return sess->client ? ZCIO_OK
+                        : zcio_fail_(ZCIO_ERR_CONNECT, "http: connect to %s:%d failed",
+                                    sess->origin.host, sess->origin.port);
+}
+
+static void session_drop(zcio_http_session *sess) {
+    if (sess->client) { zcio_tcp_client_free(sess->client); sess->client = NULL; }
+}
+
+/* True if the response's Connection header says "close" (peer will not reuse
+ * this socket for another request -- our side must drop it too). hdr_begin/
+ * hdr_end bound the exchange's already-parsed header block, read before it
+ * is freed. Same lowercase-then-strstr pattern read_response/parse_response
+ * already use for Transfer-Encoding. */
+static bool response_says_close(const char *hdr_begin, const char *hdr_end) {
+    char *v = find_header_value(hdr_begin, hdr_end, "Connection");
+    if (!v) return false;
+    for (char *c = v; *c; c++) *c = (char)tolower((unsigned char)*c);
+    bool close = strstr(v, "close") != NULL;
+    free(v);
+    return close;
+}
+
+/* One request/response over `sess`'s persistent connection (connecting first
+ * if not already). On a send/receive failure the connection is dropped so the
+ * NEXT call reconnects fresh; the caller (zcio_http_session_request) is what
+ * retries once. */
+static int session_exchange_once(zcio_http_session *sess, const char *method, const char *path,
+                                 const zcio_http_header *headers, size_t header_count,
+                                 const void *body, size_t body_len,
+                                 zcio_http_response *resp,
+                                 int connect_timeout_ms, uint64_t deadline) {
+    memset(resp, 0, sizeof *resp);
+
+    int rem = deadline_remaining_ms(deadline);
+    if (rem == 0) return zcio_fail_(ZCIO_ERR_TIMEOUT, "http: request deadline exceeded");
+    int cto = connect_timeout_ms;
+    if (rem > 0 && (cto <= 0 || cto > rem)) cto = rem;
+    int ioto = rem > 0 ? rem : 0;
+
+    int cr = session_connect(sess, cto, ioto);
+    if (cr != ZCIO_OK) return cr;
+
+    zcio_stream *s = zcio_tcp_client_stream(sess->client);
+    if (!s) { session_drop(sess); return zcio_fail_(ZCIO_ERR, "http: no stream for connection"); }
+
+    /* Same scheme/host/port as the session's origin; only the path varies
+     * per call. */
+    zcio_url u = sess->origin;
+    u.path = (char *)((path && path[0]) ? path : "/");
+
+    /* Force keep-alive: appending our own Connection header makes
+     * build_request's have_connection check skip its default
+     * "Connection: close". */
+    zcio_http_header *hdrs = (zcio_http_header *)zcio_xmalloc((header_count + 1) * sizeof(zcio_http_header));
+    if (!hdrs) return zcio_fail_(ZCIO_ERR_NOMEM, "http: out of memory");
+    for (size_t i = 0; i < header_count; i++) hdrs[i] = headers[i];
+    hdrs[header_count].key = "Connection";
+    hdrs[header_count].value = "keep-alive";
+
+    buf_t req;
+    int br = build_request(&req, method, &u, hdrs, header_count + 1, body, body_len);
+    free(hdrs);
+    if (br != ZCIO_OK) return br;
+
+    rem = deadline_remaining_ms(deadline);
+    if (rem == 0) { free(req.data); return zcio_fail_(ZCIO_ERR_TIMEOUT, "http: request deadline exceeded"); }
+    if (rem > 0) (void)zcio_stream_set_timeout_(s, rem);
+
+    int64_t wrote = zcio_write_full(s, req.data, req.len);
+    free(req.data);
+    if (wrote < 0 || (size_t)wrote != req.len) {
+        session_drop(sess);
+        return zcio_fail_(ZCIO_ERR, "http: failed to send request");
+    }
+
+    buf_t raw;
+    int rr = read_response(s, &raw, deadline);
+    if (rr != ZCIO_OK) {
+        session_drop(sess);
+        return rr;
+    }
+    /* Empty read (peer closed right after we connected, e.g. a race with its
+     * own idle-timeout) looks like ZCIO_OK with zero bytes -- treat the same
+     * as a hard failure so the caller's retry reconnects. */
+    if (raw.len == 0) {
+        free(raw.data);
+        session_drop(sess);
+        return zcio_fail_(ZCIO_ERR, "http: connection closed with no response");
+    }
+
+    int p = parse_response(&raw, resp, NULL);
+    if (p != ZCIO_OK) { free(raw.data); session_drop(sess); return p; }
+
+    /* Drop our side if the peer said it's closing this connection, so the
+     * NEXT call reconnects instead of writing into a socket the peer has
+     * already torn down. */
+    {
+        const char *sep = NULL;
+        for (size_t i = 0; i + 3 < raw.len; i++) {
+            if (raw.data[i] == '\r' && raw.data[i+1] == '\n' &&
+                raw.data[i+2] == '\r' && raw.data[i+3] == '\n') { sep = raw.data + i; break; }
+        }
+        const char *sl_end = sep ? memchr(raw.data, '\n', (size_t)(sep - raw.data)) : NULL;
+        if (sep && sl_end && response_says_close(sl_end + 1, sep)) session_drop(sess);
+    }
+    free(raw.data);
+    return ZCIO_OK;
+}
+
+zcio_http_session *zcio_http_session_create(const char *base_url) {
+    zcio_url u;
+    if (url_parse(base_url, &u) != ZCIO_OK) return NULL;
+    zcio_http_session *sess = (zcio_http_session *)zcio_xmalloc(sizeof *sess);
+    if (!sess) { url_free(&u); return NULL; }
+    memset(sess, 0, sizeof *sess);
+    sess->origin = u;   /* takes ownership of u's mallocs */
+    if (u.secure) {
+        sess->tls = zcio_tls_client_ctx(u.host);
+        if (!sess->tls) { url_free(&sess->origin); free(sess); return NULL; }
+    }
+    return sess;
+}
+
+zcio_http_response zcio_http_session_request(zcio_http_session *sess,
+                                             const char *method, const char *path,
+                                             const zcio_http_header *headers, size_t header_count,
+                                             const void *body, size_t n,
+                                             const zcio_http_opts *opts) {
+    zcio_http_response resp;
+    memset(&resp, 0, sizeof resp);
+    if (!sess) { zcio_fail_(ZCIO_ERR_INVALID_ARG, "http: NULL session"); return resp; }
+
+    int connect_timeout_ms = opts ? opts->connect_timeout_ms : 0;
+    uint64_t deadline = (opts && opts->timeout_ms > 0)
+                      ? zcio_now_ms_() + (uint64_t)opts->timeout_ms : 0;
+
+    /* One retry: if the connection we had cached turns out to be dead (the
+     * common case -- the peer's own idle timeout fired between calls), the
+     * first attempt fails fast on the stale write/read and
+     * session_exchange_once already dropped it; try once more against a
+     * fresh connect before surfacing the error. A live connection never
+     * takes this branch. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int r = session_exchange_once(sess, method, path, headers, header_count, body, n,
+                                      &resp, connect_timeout_ms, deadline);
+        if (r == ZCIO_OK) return resp;
+        if (attempt == 1) { memset(&resp, 0, sizeof resp); return resp; }
+        /* else: loop and retry once against a fresh connection. */
+    }
+    return resp; /* unreachable */
+}
+
+void zcio_http_session_free(zcio_http_session *sess) {
+    if (!sess) return;
+    session_drop(sess);
+    if (sess->tls) zcio_tls_ctx_free(sess->tls);
+    url_free(&sess->origin);
+    free(sess);
+}
+
 /* ------------------------------- public API ----------------------------- */
 
 zcio_http_response zcio_http_request(const char *method, const char *url,

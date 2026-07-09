@@ -55,6 +55,34 @@ ZCIO_API zcio_http_response zcio_http_request_opts(const char *method, const cha
                                                    const zcio_http_opts *opts);
 ZCIO_API void zcio_http_response_free(zcio_http_response *r);
 
+/* ---------------------------- keep-alive session -------------------------- *
+ * zcio_http_request[_opts] is one-shot: every call pays a fresh TCP (+TLS)
+ * connect. For a caller that repeatedly hits the SAME origin (an exchange's
+ * REST API, a metrics endpoint) a session holds ONE persistent HTTP/1.1
+ * connection open across calls, only reconnecting when the peer actually
+ * closed it (idle timeout, restart) or a call fails outrightly -- one
+ * transparent reconnect-and-retry, then the error surfaces normally.
+ *
+ * NOT internally synchronized: a session is a single logical connection, so
+ * concurrent callers must serialize their own access to one zcio_http_session
+ * (a mutex around the call site, or one session per thread) exactly as they
+ * would around a bare socket. Does not follow redirects (a REST API origin
+ * has no business issuing 3xx to begin with; use zcio_http_request_opts for
+ * anything that might).
+ */
+typedef struct zcio_http_session zcio_http_session;
+
+/* Parses `base_url`'s scheme/host/port as the session's fixed origin; every
+ * later zcio_http_session_request call's `path` is resolved against it.
+ * Returns NULL on a malformed URL or allocation failure. */
+ZCIO_API ZCIO_NODISCARD zcio_http_session *zcio_http_session_create(const char *base_url);
+ZCIO_API zcio_http_response zcio_http_session_request(zcio_http_session *sess,
+                                                       const char *method, const char *path,
+                                                       const zcio_http_header *headers, size_t header_count,
+                                                       const void *body, size_t n,
+                                                       const zcio_http_opts *opts);
+ZCIO_API void zcio_http_session_free(zcio_http_session *sess);
+
 #ifdef __cplusplus
 }
 #endif

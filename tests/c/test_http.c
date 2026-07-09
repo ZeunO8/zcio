@@ -196,6 +196,100 @@ ZTEST(http_deadline_silent_server) {
     zthread_join(th);
 }
 
+/* Multi-request server for session tests: counts distinct ACCEPTED connections
+ * (not requests) — a reused keep-alive connection should accept ONCE and serve
+ * every request off that same socket. `close_after` requests, the server
+ * closes the connection (simulating an idle-timeout/restart) so the NEXT
+ * session call must reconnect; 0 = never close early. */
+typedef struct {
+    int port, ready;
+    int requests;       /* total requests to serve before returning */
+    int close_after;    /* close the connection after this many requests on it; 0 = don't */
+    int accept_count;   /* out: how many distinct TCP connections were accepted */
+} sess_arg;
+
+static void *session_server(void *p) {
+    sess_arg *a = (sess_arg *)p;
+    zcio_tcp_server *srv = zcio_tcp_server_listen(a->port);
+    if (!srv) { a->ready = -1; return NULL; }
+    a->ready = 1;
+    int served = 0;
+    while (served < a->requests) {
+        size_t id = 0;
+        zcio_tcp_conn *conn = zcio_tcp_server_accept(srv, &id, 4000);
+        if (!conn) break;
+        a->accept_count++;
+        zcio_stream *s = zcio_tcp_conn_stream(conn);
+        int on_this_conn = 0;
+        for (;;) {
+            char req[2048];
+            int64_t n = zcio_read(s, req, sizeof req);
+            if (n <= 0) break;                 /* client dropped the connection */
+            zcio_write_full(s, kResponse, strlen(kResponse));
+            served++; on_this_conn++;
+            if (served >= a->requests) break;
+            if (a->close_after > 0 && on_this_conn >= a->close_after) break;
+        }
+        zcio_tcp_server_close_client(srv, id);
+    }
+    zthread_sleep_ms(50);
+    zcio_tcp_server_free(srv);
+    return NULL;
+}
+
+/* Three requests over one session must reuse the SAME underlying connection —
+ * the server sees exactly one accept, not three. */
+ZTEST(http_session_reuses_connection) {
+    zcio_init();
+    sess_arg arg = { .port = ztest_free_port(), .ready = 0, .requests = 3, .close_after = 0 };
+    zthread_t th;
+    zthread_start(&th, session_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char base[64];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", arg.port);
+    zcio_http_session *sess = zcio_http_session_create(base);
+    ZCHECK(sess != NULL);
+    if (!sess) { zthread_join(th); return; }
+
+    for (int i = 0; i < 3; i++) {
+        zcio_http_response r = zcio_http_session_request(sess, "GET", "/", NULL, 0, NULL, 0, NULL);
+        check_ok(&r);
+    }
+    zcio_http_session_free(sess);
+    zthread_join(th);
+    ZCHECK_EQ(arg.accept_count, 1);
+}
+
+/* Server closes after the first request (simulating its own idle timeout).
+ * The session must transparently reconnect for the second call rather than
+ * surfacing a failure — the caller only sees two successful responses, but
+ * the server saw two distinct accepts. */
+ZTEST(http_session_reconnects_after_server_close) {
+    zcio_init();
+    sess_arg arg = { .port = ztest_free_port(), .ready = 0, .requests = 2, .close_after = 1 };
+    zthread_t th;
+    zthread_start(&th, session_server, &arg);
+    while (arg.ready == 0) zthread_sleep_ms(2);
+    if (arg.ready < 0) { zthread_join(th); ZCHECK(0); return; }
+
+    char base[64];
+    snprintf(base, sizeof base, "http://127.0.0.1:%d", arg.port);
+    zcio_http_session *sess = zcio_http_session_create(base);
+    ZCHECK(sess != NULL);
+    if (!sess) { zthread_join(th); return; }
+
+    zcio_http_response r1 = zcio_http_session_request(sess, "GET", "/", NULL, 0, NULL, 0, NULL);
+    check_ok(&r1);
+    zcio_http_response r2 = zcio_http_session_request(sess, "GET", "/", NULL, 0, NULL, 0, NULL);
+    check_ok(&r2);
+
+    zcio_http_session_free(sess);
+    zthread_join(th);
+    ZCHECK_EQ(arg.accept_count, 2);
+}
+
 ZTEST(http_get_bad_host) {
     zcio_init();
     /* unresolvable host: must return a zeroed response (status 0), not crash */
