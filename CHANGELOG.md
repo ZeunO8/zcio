@@ -5,6 +5,22 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.3.4.0] - 2026-07-09
+
+### Added
+- **Crypto primitives** (`zcio/crypto.h`) for artifact integrity, self-contained
+  with no OpenSSL/platform-TLS dependency (available on every target including
+  mobile builds): SHA-256 (one-shot + streaming, FIPS 180-4), Ed25519
+  keypair/sign/verify (RFC 8032; vendored orlp/ed25519 subset under
+  `src/vendor/ed25519/`, zlib license, seeded via zcio's OS entropy), and a
+  hex codec. Tests: NIST/RFC vectors, streaming, tamper rejection
+  (`test_crypto`).
+- **HTTP server bind host**: `zcio_http_server_config.bind_host` scopes the
+  h1/h2 (and redirect) listeners to one interface — NULL/`""`/`"*"` keep
+  bind-all; names resolve to IPv4 (`"localhost"` gives a loopback-only
+  control plane). Same convention as `zcio_tcp_server_listen_host`.
+  Regression: `http_server_bind_host`.
+
 ## [1.3.3.0] - 2026-07-09
 
 ### Added

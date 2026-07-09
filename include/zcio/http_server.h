@@ -63,6 +63,11 @@ typedef void (*zcio_http_handler)(zcio_http_req *req, void *user);
 typedef struct zcio_http_server_config {
     int      port;         /* TCP port for h1/h2; UDP port for h3. 0 = ephemeral
                             * (read back with zcio_http_server_port).          */
+    const char *bind_host; /* interface to bind: NULL/""/"*" = all interfaces;
+                            * else dotted quad or name resolved to IPv4 (e.g.
+                            * "localhost" for a loopback-only control plane).
+                            * Applies to the h1/h2 and redirect listeners; the
+                            * HTTP/3 UDP socket still binds all interfaces.    */
     uint32_t versions;     /* zcio_http_versions bitmask [ZCIO_HTTP1_1]        */
 
     /* --- TLS / HTTPS --------------------------------------------------- *

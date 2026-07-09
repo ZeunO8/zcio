@@ -109,7 +109,22 @@ set(ZCIO_SOURCES
     src/h3.c
     src/qpack.c
     src/ws.c
-    src/archive.c)
+    src/archive.c
+    src/crypto.c
+    src/vendor/ed25519/fe.c
+    src/vendor/ed25519/ge.c
+    src/vendor/ed25519/sc.c
+    src/vendor/ed25519/sha512.c
+    src/vendor/ed25519/keypair.c
+    src/vendor/ed25519/sign.c
+    src/vendor/ed25519/verify.c)
+# Vendored orlp/ed25519 subset (zlib license): OS seeding is omitted — key
+# material is seeded through zcio's own entropy helper in src/crypto.c.
+set_source_files_properties(
+    src/vendor/ed25519/fe.c src/vendor/ed25519/ge.c src/vendor/ed25519/sc.c
+    src/vendor/ed25519/sha512.c src/vendor/ed25519/keypair.c
+    src/vendor/ed25519/sign.c src/vendor/ed25519/verify.c src/crypto.c
+    PROPERTIES COMPILE_DEFINITIONS ED25519_NO_SEED)
 
 # TLS backend selection: exactly one backend TU defines
 # zcio_tls_install_default_backend().

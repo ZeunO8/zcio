@@ -18,6 +18,7 @@ add_zcio_test(test_util            tests/c/test_util.c)
 add_zcio_test(test_dns             tests/c/test_dns.c)
 add_zcio_test(test_archive         tests/c/test_archive.c)
 add_zcio_test(test_hardening       tests/c/test_hardening.c)
+add_zcio_test(test_crypto          tests/c/test_crypto.c)
 
 # Networking/loopback tests. These now use the portable tests/c/zthread.h shim
 # (pthreads on POSIX, Win32 threads on Windows), so they build on all platforms.

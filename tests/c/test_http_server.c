@@ -183,4 +183,40 @@ ZTEST(http_server_loopback) {
     zcio_http_server_free(srv);
 }
 
+/* bind_host: a loopback-scoped server accepts on 127.0.0.1; a bogus bind host
+ * fails start() cleanly. */
+ZTEST(http_server_bind_host) {
+    zcio_init();
+
+    zcio_http_server_config cfg;
+    memset(&cfg, 0, sizeof cfg);
+    cfg.port = 0;
+    cfg.bind_host = "127.0.0.1";
+    cfg.drain_timeout_ms = 500;
+
+    zcio_http_server *srv = zcio_http_server_start(&cfg, handler, NULL);
+    ZCHECK(srv != NULL);
+    if (!srv) return;
+    int port = zcio_http_server_port(srv);
+
+    zthread_t th;
+    zthread_start(&th, run_thread, srv);
+    zthread_sleep_ms(50);
+
+    char url[64];
+    snprintf(url, sizeof url, "http://127.0.0.1:%d/ping", port);
+    zcio_http_response r = zcio_http_get(url);
+    ZCHECK_EQ(r.status, 200);
+    zcio_http_response_free(&r);
+
+    zcio_http_server_stop(srv);
+    zthread_join(th);
+    zcio_http_server_free(srv);
+
+    memset(&cfg, 0, sizeof cfg);
+    cfg.port = 0;
+    cfg.bind_host = "no.such.host.invalid.zcio.test.";
+    ZCHECK(zcio_http_server_start(&cfg, handler, NULL) == NULL);
+}
+
 ZTEST_MAIN()

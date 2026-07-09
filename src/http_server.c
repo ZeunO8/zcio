@@ -74,6 +74,7 @@ typedef struct conn {
 struct zcio_http_server {
     zcio_http_server_config cfg;      /* shallow copy; strings below re-owned  */
     char              *host_owned;    /* dup of cfg.host (or NULL)             */
+    char              *bind_owned;    /* dup of cfg.bind_host (or NULL)        */
     char              *cert_owned;    /* dup of cfg.cert_file (or NULL)        */
     char              *key_owned;     /* dup of cfg.key_file (or NULL)         */
     uint32_t           versions;      /* resolved (defaults to HTTP1_1)        */
@@ -573,9 +574,29 @@ static void server_remove_dead(zcio_http_server *srv) {
  * ========================================================================= */
 
 /* Create a non-blocking TCP listener. Deliberately no SO_REUSEADDR: matches the
- * server's documented behavior (fresh ephemeral ports across restarts). */
-static zcio_socket make_listener(int port, int *out_port) {
+ * server's documented behavior (fresh ephemeral ports across restarts).
+ * bind_host: NULL/""/"*" bind all interfaces; else a dotted quad or a name
+ * resolved to IPv4 (same convention as zcio_tcp_server_listen_host). */
+static zcio_socket make_listener(const char *bind_host, int port, int *out_port) {
     zcio_socket_startup();
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    if (!bind_host || !bind_host[0] || (bind_host[0] == '*' && !bind_host[1])) {
+        addr.sin_addr.s_addr = INADDR_ANY;
+    } else if (inet_pton(AF_INET, bind_host, &addr.sin_addr) != 1) {
+        char *ip = zcio_resolve_ipv4(bind_host);
+        if (!ip) return ZCIO_INVALID_SOCKET; /* resolve_ipv4 set the error */
+        int ok = inet_pton(AF_INET, ip, &addr.sin_addr) == 1;
+        free(ip);
+        if (!ok) {
+            zcio_fail_(ZCIO_ERR, "http: cannot bind host '%s'", bind_host);
+            return ZCIO_INVALID_SOCKET;
+        }
+    }
+
     zcio_socket fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == ZCIO_INVALID_SOCKET) {
         zcio_fail_(ZCIO_ERR, "http: socket() failed");
@@ -587,11 +608,6 @@ static zcio_socket make_listener(int port, int *out_port) {
         zcio_fail_(ZCIO_ERR, "http: set non-blocking failed");
         return ZCIO_INVALID_SOCKET;
     }
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((unsigned short)port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0) {
         zcio_closesocket(fd);
         zcio_fail_(ZCIO_ERR, "http: bind(:%d) failed", port);
@@ -913,9 +929,11 @@ zcio_http_server *zcio_http_server_start(const zcio_http_server_config *cfg,
     /* Re-own the caller string fields so cfg's originals may be freed. */
     if (cfg) {
         s->host_owned = zcio_strdup_(cfg->host);
+        s->bind_owned = zcio_strdup_(cfg->bind_host);
         s->cert_owned = zcio_strdup_(cfg->cert_file);
         s->key_owned  = zcio_strdup_(cfg->key_file);
         if ((cfg->host && !s->host_owned) ||
+            (cfg->bind_host && !s->bind_owned) ||
             (cfg->cert_file && !s->cert_owned) ||
             (cfg->key_file && !s->key_owned)) {
             zcio_fail_(ZCIO_ERR_NOMEM, "start: out of memory");
@@ -923,6 +941,7 @@ zcio_http_server *zcio_http_server_start(const zcio_http_server_config *cfg,
         }
     }
     s->cfg.host = s->host_owned;
+    s->cfg.bind_host = s->bind_owned;
     s->cfg.cert_file = s->cert_owned;
     s->cfg.key_file = s->key_owned;
 
@@ -930,11 +949,11 @@ zcio_http_server *zcio_http_server_start(const zcio_http_server_config *cfg,
 
     if (make_wake(s) != ZCIO_OK) { zcio_fail_(ZCIO_ERR, "start: wake pipe failed"); goto fail; }
 
-    s->listen_fd = make_listener(s->cfg.port, &s->bound_port);
+    s->listen_fd = make_listener(s->cfg.bind_host, s->cfg.port, &s->bound_port);
     if (s->listen_fd == ZCIO_INVALID_SOCKET) goto fail;
 
     if (s->cfg.redirect_port > 0) {
-        s->redirect_fd = make_listener(s->cfg.redirect_port, NULL);
+        s->redirect_fd = make_listener(s->cfg.bind_host, s->cfg.redirect_port, NULL);
         if (s->redirect_fd == ZCIO_INVALID_SOCKET) goto fail;
     }
 
@@ -962,6 +981,7 @@ void zcio_http_server_free(zcio_http_server *s) {
     free_wake(s);
     if (s->tls && s->tls_owned) zcio_tls_ctx_free(s->tls);  /* borrowed: never */
     free(s->host_owned);
+    free(s->bind_owned);
     free(s->cert_owned);
     free(s->key_owned);
     free(s);
