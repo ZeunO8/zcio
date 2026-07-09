@@ -13,6 +13,7 @@
  */
 #include "zcio/tls.h"
 #include "internal.h"
+#include "tls_ossl_internal.h"
 
 #include <limits.h>
 
@@ -34,6 +35,11 @@
 struct zcio_tls_ctx {
     SSL_CTX *ctx;
     char    *host;  /* strdup'd; used for SNI on the client. NULL for server. */
+    /* ALPN protocol list in wire format (len-prefixed), set via
+     * zcio_tls_ctx_set_alpn. Client: offered list. Server: preference order
+     * for the selection callback. */
+    unsigned char *alpn;
+    unsigned int   alpn_len;
 };
 
 /* --- last OpenSSL error -> thread-local message ----------------------------*/
@@ -149,6 +155,9 @@ typedef struct tls_stream {
     BIO         *bio;    /* the zcio_stream BIO; owned by ssl after SSL_set_bio */
     zcio_stream *plain;  /* owned: freed on destroy */
     bool         shut;   /* close_notify already sent; shutdown runs once       */
+    bool         verify; /* client requested verification (checked post-hs)     */
+    bool         verified; /* post-handshake verify_result check already passed */
+    char         alpn[32]; /* NUL-terminated negotiated protocol, "" if none    */
 } tls_stream;
 
 static int64_t tls_strm_read(void *vctx, void *dst, size_t n) {
@@ -272,13 +281,9 @@ static zcio_tls_ctx *ossl_client_ctx(const char *host) {
     return c;
 }
 
-static zcio_tls_ctx *ossl_server_ctx(void) {
-    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
-    if (!ssl_ctx) {
-        tls_set_ossl_error("SSL_CTX_new(server)");
-        return NULL;
-    }
-
+/* Generate + install a self-signed localhost cert. Shared with the QUIC (h3)
+ * listener via tls_ossl_internal.h. Returns 1 on success, 0 on failure. */
+int zcio_ossl_selfsign_install_(SSL_CTX *ssl_ctx) {
     const int kBits = 2048;
     const int kCertDuration = 365;
 
@@ -344,8 +349,16 @@ cleanup:
     if (rsa)  RSA_free(rsa);
     if (pkey) EVP_PKEY_free(pkey);
     if (x509) X509_free(x509);
+    return ok;
+}
 
-    if (!ok) {
+static zcio_tls_ctx *ossl_server_ctx(void) {
+    SSL_CTX *ssl_ctx = SSL_CTX_new(TLS_server_method());
+    if (!ssl_ctx) {
+        tls_set_ossl_error("SSL_CTX_new(server)");
+        return NULL;
+    }
+    if (!zcio_ossl_selfsign_install_(ssl_ctx)) {
         tls_set_ossl_error("server cert generation");
         SSL_CTX_free(ssl_ctx);
         return NULL;
@@ -403,15 +416,84 @@ static void ossl_ctx_free(zcio_tls_ctx *ctx) {
     if (!ctx) return;
     if (ctx->ctx) SSL_CTX_free(ctx->ctx);
     free(ctx->host);
+    free(ctx->alpn);
     free(ctx);
+}
+
+/* ===========================================================================
+ * ALPN.
+ * ===========================================================================*/
+
+/* Server-side selection: pick by OUR preference order (ctx->alpn) against the
+ * client's offered list. No overlap -> NOACK (continue without ALPN; the
+ * server layer treats that as HTTP/1.1 or closes, per its config). */
+static int ossl_alpn_select_cb(SSL *ssl, const unsigned char **out,
+                               unsigned char *outlen, const unsigned char *in,
+                               unsigned int inlen, void *arg) {
+    (void)ssl;
+    zcio_tls_ctx *c = (zcio_tls_ctx *)arg;
+    if (!c || !c->alpn || c->alpn_len == 0) return SSL_TLSEXT_ERR_NOACK;
+    unsigned char *sel = NULL;
+    unsigned char sel_len = 0;
+    /* SSL_select_next_proto scans OUR list first, so ours is the preference
+     * order. It returns OPENSSL_NPN_NEGOTIATED (1) on a real overlap. */
+    if (SSL_select_next_proto(&sel, &sel_len, c->alpn, c->alpn_len,
+                              in, inlen) != OPENSSL_NPN_NEGOTIATED)
+        return SSL_TLSEXT_ERR_NOACK;
+    *out = sel;
+    *outlen = sel_len;
+    return SSL_TLSEXT_ERR_OK;
+}
+
+static int ossl_ctx_set_alpn(zcio_tls_ctx *ctx, const char *const *protos, size_t n) {
+    if (!ctx || !ctx->ctx || (!protos && n))
+        return zcio_fail_(ZCIO_ERR_INVALID_ARG, "alpn: missing ctx/protos");
+
+    /* Build the wire format: 1-byte length prefix per protocol. */
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t len = protos[i] ? strlen(protos[i]) : 0;
+        if (len == 0 || len > 255)
+            return zcio_fail_(ZCIO_ERR_INVALID_ARG, "alpn: bad protocol length");
+        total += 1 + len;
+    }
+    if (total > UINT_MAX)
+        return zcio_fail_(ZCIO_ERR_INVALID_ARG, "alpn: list too long");
+
+    unsigned char *wire = (unsigned char *)zcio_xmalloc(total ? total : 1);
+    if (!wire) return zcio_fail_(ZCIO_ERR_NOMEM, "alpn: out of memory");
+    size_t off = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t len = strlen(protos[i]);
+        wire[off++] = (unsigned char)len;
+        memcpy(wire + off, protos[i], len);
+        off += len;
+    }
+
+    free(ctx->alpn);
+    ctx->alpn = wire;
+    ctx->alpn_len = (unsigned int)total;
+
+    /* Client role: offer the list (harmless on a server ctx). Note OpenSSL's
+     * inverted convention: 0 is success here. */
+    if (n && SSL_CTX_set_alpn_protos(ctx->ctx, wire, (unsigned int)total) != 0) {
+        tls_set_ossl_error("SSL_CTX_set_alpn_protos");
+        return ZCIO_ERR_TLS;
+    }
+    /* Server role: select on our preference order (no-op for client ctxs). */
+    SSL_CTX_set_alpn_select_cb(ctx->ctx, n ? ossl_alpn_select_cb : NULL, ctx);
+    return ZCIO_OK;
 }
 
 /* ===========================================================================
  * wrap(): build SSL over a custom BIO, handshake, return a TLS stream.
  * ===========================================================================*/
 
-static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
-                              bool is_server, bool verify) {
+/* Common construction: SSL over the zcio_stream BIO, role + SNI + verify
+ * configured, NO handshake yet. On failure returns NULL and leaves `plain`
+ * untouched; on success the returned stream owns `plain`. */
+static zcio_stream *ossl_make_stream(zcio_tls_ctx *ctx, zcio_stream *plain,
+                                     bool is_server, bool verify) {
     if (!ctx || !ctx->ctx || !plain) {
         zcio_fail_(ZCIO_ERR_INVALID_ARG, "tls wrap: missing ctx or stream");
         return NULL;
@@ -458,49 +540,16 @@ static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
         }
     }
 
-    /* Handshake with WANT_READ/WANT_WRITE retry, mirroring tcp_streambuf.cpp.
-     * The underlying transport is expected to block (or report WOULDBLOCK,
-     * which surfaces via BIO_should_retry); we loop while it asks to retry. */
-    for (;;) {
-        int hs = is_server ? SSL_accept(ssl) : SSL_connect(ssl);
-        if (hs == 1) break; /* handshake complete */
-        int err = SSL_get_error(ssl, hs);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-            if (BIO_should_retry(bio)) continue;
-            /* Non-blocking transport with nothing pending: cannot complete a
-             * synchronous handshake here. Fail rather than spin. */
-            zcio_fail_(ZCIO_ERR_TLS, "TLS handshake would block");
-            SSL_free(ssl); /* frees bio; does NOT free plain */
-            return NULL;
-        }
-        tls_set_ossl_error(is_server ? "SSL_accept" : "SSL_connect");
-        SSL_free(ssl); /* frees bio; leaves plain untouched */
-        return NULL;
-    }
-
-    /* Defense in depth: for a verifying client, require that the peer chain
-     * actually validated. SSL_VERIFY_PEER usually aborts the handshake on
-     * failure, but assert X509_V_OK explicitly so a misconfiguration can never
-     * yield a "successful" handshake over an unverified peer. */
-    if (!is_server && verify) {
-        long vr = SSL_get_verify_result(ssl);
-        if (vr != X509_V_OK) {
-            zcio_fail_(ZCIO_ERR_TLS, "TLS certificate verification failed: %s",
-                       X509_verify_cert_error_string(vr));
-            SSL_free(ssl); /* frees bio; leaves plain untouched */
-            return NULL;
-        }
-    }
-
     tls_stream *t = (tls_stream *)zcio_xcalloc(1, sizeof *t);
     if (!t) {
         SSL_free(ssl);
         zcio_fail_(ZCIO_ERR_NOMEM, "out of memory");
         return NULL;
     }
-    t->ssl   = ssl;
-    t->bio   = bio;
-    t->plain = plain; /* ownership transferred on success */
+    t->ssl    = ssl;
+    t->bio    = bio;
+    t->plain  = plain; /* ownership transferred on success */
+    t->verify = !is_server && verify;
 
     uint32_t flags = ZCIO_STREAM_OWNS_CTX | ZCIO_STREAM_READABLE | ZCIO_STREAM_WRITABLE;
     zcio_stream *s = zcio_stream_new(&g_tls_vtable, t, flags);
@@ -515,6 +564,91 @@ static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
     return s;
 }
 
+/* Defense in depth: for a verifying client, require that the peer chain
+ * actually validated. SSL_VERIFY_PEER usually aborts the handshake on
+ * failure, but assert X509_V_OK explicitly so a misconfiguration can never
+ * yield a "successful" handshake over an unverified peer. Idempotent. */
+static int ossl_post_handshake_check(tls_stream *t) {
+    if (!t->verify || t->verified) return ZCIO_OK;
+    long vr = SSL_get_verify_result(t->ssl);
+    if (vr != X509_V_OK)
+        return zcio_fail_(ZCIO_ERR_TLS, "TLS certificate verification failed: %s",
+                          X509_verify_cert_error_string(vr));
+    t->verified = true;
+    return ZCIO_OK;
+}
+
+/* One handshake step. ZCIO_OK when complete, ZCIO_ERR_WOULDBLOCK when the
+ * transport has nothing (retryable), negative zcio_result otherwise. */
+static int ossl_handshake_step(tls_stream *t, bool is_server_hint) {
+    if (SSL_is_init_finished(t->ssl)) return ossl_post_handshake_check(t);
+    int hs = SSL_do_handshake(t->ssl);
+    if (hs == 1) return ossl_post_handshake_check(t);
+    int err = SSL_get_error(t->ssl, hs);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+        return ZCIO_ERR_WOULDBLOCK;
+    tls_set_ossl_error(is_server_hint ? "SSL_accept" : "SSL_connect");
+    return ZCIO_ERR_TLS;
+}
+
+static zcio_stream *ossl_wrap(zcio_tls_ctx *ctx, zcio_stream *plain,
+                              bool is_server, bool verify) {
+    zcio_stream *s = ossl_make_stream(ctx, plain, is_server, verify);
+    if (!s) return NULL;
+    tls_stream *t = (tls_stream *)s->ctx;
+
+    /* Handshake with WANT_READ/WANT_WRITE retry, mirroring tcp_streambuf.cpp.
+     * The underlying transport is expected to block (or report WOULDBLOCK,
+     * which surfaces via BIO_should_retry); we loop while it asks to retry. */
+    for (;;) {
+        int r = ossl_handshake_step(t, is_server);
+        if (r == ZCIO_OK) break;
+        if (r == ZCIO_ERR_WOULDBLOCK && BIO_should_retry(t->bio)) continue;
+        if (r == ZCIO_ERR_WOULDBLOCK)
+            /* Non-blocking transport with nothing pending: cannot complete a
+             * synchronous handshake here. Fail rather than spin. */
+            zcio_fail_(ZCIO_ERR_TLS, "TLS handshake would block");
+        /* Detach plain so the caller keeps ownership on failure. */
+        t->plain = NULL;
+        zcio_stream_free(s);
+        return NULL;
+    }
+    return s;
+}
+
+/* Non-blocking overlay: no handshake here; reads/writes (or the public
+ * zcio_tls_handshake pump) complete it incrementally. */
+static zcio_stream *ossl_wrap_nb(zcio_tls_ctx *ctx, zcio_stream *plain,
+                                 bool is_server, bool verify) {
+    return ossl_make_stream(ctx, plain, is_server, verify);
+}
+
+static int ossl_handshake(zcio_stream *s) {
+    if (!s || s->vt != &g_tls_vtable || !s->ctx)
+        return zcio_fail_(ZCIO_ERR_INVALID_ARG, "tls handshake: not a tls stream");
+    tls_stream *t = (tls_stream *)s->ctx;
+    return ossl_handshake_step(t, SSL_is_server(t->ssl));
+}
+
+static zcio_stream *ossl_stream_transport(zcio_stream *s) {
+    if (!s || s->vt != &g_tls_vtable || !s->ctx) return NULL;
+    return ((tls_stream *)s->ctx)->plain;
+}
+
+static const char *ossl_stream_alpn(zcio_stream *s) {
+    if (!s || s->vt != &g_tls_vtable || !s->ctx) return NULL;
+    tls_stream *t = (tls_stream *)s->ctx;
+    if (!SSL_is_init_finished(t->ssl)) return NULL;
+    if (t->alpn[0]) return t->alpn; /* cached */
+    const unsigned char *proto = NULL;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(t->ssl, &proto, &len);
+    if (!proto || len == 0 || len >= sizeof t->alpn) return NULL;
+    memcpy(t->alpn, proto, len);
+    t->alpn[len] = '\0';
+    return t->alpn;
+}
+
 /* ===========================================================================
  * Backend registration.
  * ===========================================================================*/
@@ -526,6 +660,11 @@ static const zcio_tls_backend g_openssl_backend = {
     .server_ctx_files = ossl_server_ctx_files,
     .ctx_free         = ossl_ctx_free,
     .wrap             = ossl_wrap,
+    .ctx_set_alpn     = ossl_ctx_set_alpn,
+    .wrap_nb          = ossl_wrap_nb,
+    .handshake        = ossl_handshake,
+    .stream_alpn      = ossl_stream_alpn,
+    .stream_transport = ossl_stream_transport,
 };
 
 void zcio_tls_install_default_backend(void) {

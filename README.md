@@ -40,11 +40,78 @@ with a C FFI bind it cleanly.
 | `zcio/ring.h`   | lock-free SPSC ring buffer (own or shared-memory) |
 | `zcio/membuf.h` | fixed memory view + byte-counting streams |
 | `zcio/net.h`    | TCP client/server, UDP client/server, UDP multicast |
-| `zcio/tls.h`    | pluggable TLS backend (OpenSSL default, or compiled out) |
+| `zcio/tls.h`    | pluggable TLS backend (OpenSSL default, or compiled out) + ALPN |
 | `zcio/http.h`   | minimal synchronous HTTP/1.1 client |
+| `zcio/http_server.h` | hardened HTTP/1.1 · HTTP/2 · HTTP/3 server (version by config) + auto-HTTPS |
+| `zcio/ws.h`     | RFC 6455 WebSocket client + server (auto ws→wss upgrade) |
 | `zcio/dns.h`    | resolution + address utilities |
 | `zcio/archive.h`| tar/gz entries via libarchive (opt-in) |
 | `zcio/zcio.hpp` | header-only C++ RAII wrapper (ergonomic `<<` / `>>`) |
+
+## HTTP server (1.1 / 2 / 3) + WebSocket
+
+`zcio/http_server.h` is a single-threaded, non-blocking, **hardened** origin
+server. Which protocol versions it offers is a config setting — the wire
+negotiation (ALPN for h2, prior-knowledge preface, QUIC/ALPN for h3) is handled
+internally. HTTP/3 requires OpenSSL ≥ 3.5 (QUIC); without it the server simply
+declines to offer h3.
+
+```c
+#include "zcio/http_server.h"
+#include "zcio/ws.h"
+
+/* A detached WebSocket session owns its connection and is used synchronously,
+ * so run it OFF the event loop (the handler must never block — see note). */
+static void *ws_echo(void *arg) {
+    zcio_ws *ws = (zcio_ws *)arg;
+    zcio_ws_msg m;
+    while (zcio_ws_recv(ws, &m, 30000) == ZCIO_OK) {
+        zcio_ws_send(ws, m.type, m.data, m.len);      /* echo               */
+        zcio_ws_msg_free(&m);
+    }
+    zcio_ws_free(ws);
+    return NULL;
+}
+
+static void on_request(zcio_http_req *req, void *user) {
+    if (zcio_http_req_is_ws_upgrade(req)) {           /* WebSocket handshake  */
+        zcio_ws *ws = zcio_ws_accept(req);            /* detaches the conn    */
+        pthread_t t;                                  /* hand off to a thread */
+        pthread_create(&t, NULL, ws_echo, ws);
+        pthread_detach(t);
+        return;
+    }
+    const char *body = "hello";
+    zcio_http_respond(req, 200, NULL, 0, body, 5);    /* respond in-line      */
+}
+
+int main(void) {
+    zcio_http_server_config cfg = {0};
+    cfg.port     = 8443;
+    cfg.versions = ZCIO_HTTP1_1 | ZCIO_HTTP2 | ZCIO_HTTP3;  /* by config     */
+    cfg.require_tls   = true;     /* self-signed if no cert/key given         */
+    cfg.redirect_port = 8080;     /* plaintext :8080 → 301 https://…          */
+    cfg.hsts          = true;     /* Strict-Transport-Security on TLS resps   */
+
+    zcio_http_server *s = zcio_http_server_start(&cfg, on_request, NULL);
+    zcio_http_server_run(s);      /* until zcio_http_server_stop() (e.g. from */
+    zcio_http_server_free(s);     /* a SIGINT handler — it is async-safe)     */
+}
+```
+
+> The handler runs **synchronously on the event-loop thread**, so it must not
+> block: respond quickly, and hand any long-lived work (a WebSocket session, a
+> slow backend call) to a thread of your own — as `on_request` does above.
+
+**Algorithmic security** is a first-class goal: every parser is single-pass and
+linear-time over bounded input, and all limits are enforced *before* memory is
+committed — header/URL/body caps, per-connection output caps, slowloris and idle
+deadlines, and explicit flood guards for HTTP/2 (rapid-reset, CONTINUATION,
+SETTINGS/PING) and HPACK/QPACK integer + Huffman bounds. Request smuggling is
+refused structurally (no TE+CL, no obs-fold, no bare-LF, single Host, strict
+chunked framing). WebSocket framing enforces the RFC 6455 mask/RSV/UTF-8/control
+-frame rules. See `include/zcio/http_server.h` and `include/zcio/ws.h` for the
+full contract and every tunable limit.
 
 ## Build
 

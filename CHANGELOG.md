@@ -5,6 +5,40 @@ All notable changes to **zcio** are documented here. The format follows
 four-component version (`MAJOR.MINOR.PATCH.TWEAK`); the shared-library SONAME
 tracks `MAJOR`.
 
+## [1.1.0.0] - 2026-07-09
+
+### Added
+- **HTTP server** (`zcio/http_server.h`): a single-threaded, non-blocking,
+  hardened origin server speaking **HTTP/1.1, HTTP/2, and HTTP/3** — the offered
+  version(s) are a config bitmask; ALPN, HTTP/2 prior-knowledge preface
+  detection, and QUIC negotiation are handled internally. HTTP/3 runs over the
+  OpenSSL ≥ 3.5 QUIC stack and self-disables (never offered) otherwise.
+- **WebSocket** (`zcio/ws.h`): RFC 6455 client and server. Server upgrades detach
+  the connection from the event loop; the client dials `ws://`/`wss://`,
+  auto-upgrades `ws→wss` across redirects, and refuses `wss→ws` downgrades.
+- **Auto-HTTPS**: optional plaintext redirect listener (301 → `https://`),
+  `Strict-Transport-Security` (HSTS) on TLS responses, and `Alt-Svc: h3` advertising
+  when HTTP/3 is enabled.
+- **TLS ALPN + non-blocking handshake** (`zcio/tls.h`): `zcio_tls_ctx_set_alpn`,
+  `zcio_tls_wrap_nb` / `zcio_tls_handshake` (incremental handshake for the event
+  loop), and `zcio_tls_stream_alpn`.
+- **HPACK** (RFC 7541) and **QPACK** (RFC 9204, static-table) codecs, and OS-entropy
+  helper used for WebSocket masking/nonces.
+
+### Security
+- Algorithmically hardened parsers: single-pass, linear-time, every length
+  bounds-checked and overflow-guarded before allocation; bounded (non-hashed)
+  header storage.
+- HTTP/1.1 request-smuggling defenses: reject Transfer-Encoding + Content-Length
+  together, obs-fold, bare-LF line endings, whitespace before `:`, and multiple
+  `Host`; strict chunked framing with a running body cap.
+- HTTP/2 flood guards: rapid-reset (CVE-2023-44487), CONTINUATION flood
+  (CVE-2024-27316), SETTINGS/PING floods, and flow-control window overflow.
+- Response-header injection refused (CR/LF/NUL and hop-by-hop/server-owned headers
+  filtered); slowloris / idle / write deadlines and per-connection output caps.
+- Full suite passes under `-fsanitize=address,undefined`, including a real
+  end-to-end HTTP/3 exchange (OpenSSL QUIC client vs the server).
+
 ## [1.0.0.0]
 
 First stable release. The C ABI is now considered frozen for the 1.x series.

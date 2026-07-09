@@ -49,10 +49,14 @@ typedef struct tcp_sockctx {
 static int64_t tcp_s_read(void *c, void *dst, size_t n) {
     tcp_sockctx *s = (tcp_sockctx *)c;
     if (s->closed || s->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
-    sock_wait w = tcp_wait(s->fd, s->timeout_ms, true, false);
-    if (w.rc < 0)  return ZCIO_ERR;
-    if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
-    if (!w.readable) return ZCIO_ERR_TIMEOUT;
+    /* timeout 0 = fully non-blocking: skip the wait and let recv() surface
+     * EWOULDBLOCK below (the HTTP server event loop drives readiness). */
+    if (s->timeout_ms != 0) {
+        sock_wait w = tcp_wait(s->fd, s->timeout_ms, true, false);
+        if (w.rc < 0)  return ZCIO_ERR;
+        if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
+        if (!w.readable) return ZCIO_ERR_TIMEOUT;
+    }
 
     long long got;
     do {
@@ -78,10 +82,12 @@ static int64_t tcp_s_read(void *c, void *dst, size_t n) {
 static int64_t tcp_s_write(void *c, const void *src, size_t n) {
     tcp_sockctx *s = (tcp_sockctx *)c;
     if (s->closed || s->fd == ZCIO_INVALID_SOCKET) return ZCIO_ERR_EOF;
-    sock_wait w = tcp_wait(s->fd, s->timeout_ms, false, true);
-    if (w.rc < 0)  return ZCIO_ERR;
-    if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
-    if (!w.writable) return ZCIO_ERR_TIMEOUT;
+    if (s->timeout_ms != 0) { /* 0 = non-blocking; see tcp_s_read */
+        sock_wait w = tcp_wait(s->fd, s->timeout_ms, false, true);
+        if (w.rc < 0)  return ZCIO_ERR;
+        if (w.rc == 0) return ZCIO_ERR_TIMEOUT;
+        if (!w.writable) return ZCIO_ERR_TIMEOUT;
+    }
 
     long long sent;
     do {
@@ -176,6 +182,22 @@ static zcio_stream *tcp_make_plain_stream(zcio_socket fd) {
         ZCIO_STREAM_OWNS_CTX | ZCIO_STREAM_READABLE | ZCIO_STREAM_WRITABLE);
     if (!st) { free(ctx); return NULL; }
     return st;
+}
+
+/* Internal (see internal.h): wrap an already-connected fd; the stream owns and
+ * closes it. timeout_ms == 0 makes every op non-blocking (WOULDBLOCK). */
+zcio_stream *zcio_tcp_stream_from_fd_(zcio_socket fd, int timeout_ms) {
+    zcio_stream *st = tcp_make_plain_stream(fd);
+    if (!st) return NULL;
+    ((tcp_sockctx *)st->ctx)->timeout_ms = timeout_ms;
+    return st;
+}
+
+int zcio_tcp_stream_set_timeout_(zcio_stream *s, int timeout_ms) {
+    if (!s || s->vt != &TCP_VT || !s->ctx)
+        return zcio_fail_(ZCIO_ERR_INVALID_ARG, "set_timeout: not a tcp stream");
+    ((tcp_sockctx *)s->ctx)->timeout_ms = timeout_ms;
+    return ZCIO_OK;
 }
 
 /* ------------------------------- connect -------------------------------- */

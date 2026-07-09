@@ -67,3 +67,44 @@ zcio_stream *zcio_tls_wrap(zcio_tls_ctx *ctx, zcio_stream *plain, bool is_server
     }
     return g_backend->wrap(ctx, plain, is_server, verify);
 }
+
+/* --- optional extensions (ALPN / non-blocking handshake) ----------------- */
+
+int zcio_tls_ctx_set_alpn(zcio_tls_ctx *ctx, const char *const *protos, size_t n) {
+    if (!g_backend || !g_backend->ctx_set_alpn)
+        return zcio_fail_(ZCIO_ERR_UNSUPPORTED, "TLS backend has no ALPN support");
+    return g_backend->ctx_set_alpn(ctx, protos, n);
+}
+
+zcio_stream *zcio_tls_wrap_nb(zcio_tls_ctx *ctx, zcio_stream *plain,
+                              bool is_server, bool verify) {
+    if (!g_backend || !g_backend->wrap_nb) {
+        zcio_fail_(ZCIO_ERR_UNSUPPORTED, "TLS backend has no non-blocking wrap");
+        return NULL;
+    }
+    return g_backend->wrap_nb(ctx, plain, is_server, verify);
+}
+
+int zcio_tls_handshake(zcio_stream *tls) {
+    if (!g_backend || !g_backend->handshake)
+        return zcio_fail_(ZCIO_ERR_UNSUPPORTED, "TLS backend has no handshake pump");
+    return g_backend->handshake(tls);
+}
+
+const char *zcio_tls_stream_alpn(zcio_stream *tls) {
+    if (!g_backend || !g_backend->stream_alpn) return NULL;
+    return g_backend->stream_alpn(tls);
+}
+
+/* Set a transport timeout on either a bare socket stream or a TLS overlay
+ * (reaching through to its underlying socket stream). Lives here so it can
+ * consult the TLS backend without the tcp layer knowing about TLS. */
+int zcio_stream_set_timeout_(zcio_stream *s, int timeout_ms) {
+    if (zcio_tcp_stream_set_timeout_(s, timeout_ms) == ZCIO_OK)
+        return ZCIO_OK;
+    if (g_backend && g_backend->stream_transport) {
+        zcio_stream *t = g_backend->stream_transport(s);
+        if (t) return zcio_tcp_stream_set_timeout_(t, timeout_ms);
+    }
+    return zcio_fail_(ZCIO_ERR_INVALID_ARG, "set_timeout: unsupported stream");
+}

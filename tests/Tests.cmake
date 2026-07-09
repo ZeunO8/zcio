@@ -27,8 +27,29 @@ add_zcio_test(test_tls_more     tests/c/test_tls_more.c)
 add_zcio_test(test_http         tests/c/test_http.c)
 add_zcio_test(test_net_advanced tests/c/test_net_advanced.c)
 add_zcio_test(test_mcast        tests/c/test_mcast.c)
+
+# HTTP server / WebSocket suite. test_hpack exercises internal codecs, so it
+# sees src/ too (static-lib internals; not part of the public ABI).
+add_zcio_test(test_hpack        tests/c/test_hpack.c)
+target_include_directories(test_hpack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_zcio_test(test_http_server  tests/c/test_http_server.c)
+add_zcio_test(test_h2           tests/c/test_h2.c)
+add_zcio_test(test_ws           tests/c/test_ws.c)
+# The h2 test client reuses the library's internal HPACK codec.
+target_include_directories(test_h2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+set(ZCIO_LOOPBACK_TESTS test_http_server test_h2 test_ws)
+
+# The h3 test drives the server with OpenSSL's own QUIC client (and the
+# library's internal QPACK codec), so it needs OpenSSL headers directly; it
+# self-skips at runtime on OpenSSL < 3.5.
+if(ZCIO_TLS STREQUAL "openssl")
+    add_zcio_test(test_h3 tests/c/test_h3.c)
+    target_include_directories(test_h3 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    list(APPEND ZCIO_LOOPBACK_TESTS test_h3)
+endif()
+
 # Link the system threads lib where the shim uses pthreads (no-op on Windows).
-foreach(t test_tls test_http test_mcast)
+foreach(t test_tls test_http test_mcast ${ZCIO_LOOPBACK_TESTS})
     target_link_libraries(${t} PRIVATE Threads::Threads)
 endforeach()
 

@@ -35,14 +35,40 @@ void zcio_socket_nosigpipe(zcio_socket fd) {
 #endif
 
 /* Monotonic milliseconds for deadline tracking. */
-static long long zcio_now_ms(void) {
+uint64_t zcio_now_ms_(void) {
 #if defined(_WIN32)
-    return (long long)GetTickCount64();
+    return (uint64_t)GetTickCount64();
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 #endif
+}
+static long long zcio_now_ms(void) { return (long long)zcio_now_ms_(); }
+
+/* EINTR-safe poll over many fds (the HTTP server event loop). Retries with
+ * the remaining timeout so a signal stream cannot extend the deadline. */
+int zcio_poll_(struct pollfd *fds, size_t nfds, int timeout_ms) {
+    long long deadline = (timeout_ms >= 0) ? zcio_now_ms() + timeout_ms : 0;
+    for (;;) {
+#if defined(_WIN32)
+        int rc = WSAPoll(fds, (ULONG)nfds, timeout_ms);
+        return rc; /* WSAPoll is not interrupted by signals */
+#else
+        int t = timeout_ms;
+        if (timeout_ms >= 0) {
+            long long remaining = deadline - zcio_now_ms();
+            if (remaining < 0) remaining = 0;
+            t = (int)remaining;
+        }
+        int rc = poll(fds, (nfds_t)nfds, t);
+        if (rc < 0 && errno == EINTR) {
+            if (timeout_ms < 0 || deadline - zcio_now_ms() > 0) continue;
+            return 0; /* deadline passed while handling signals: timeout */
+        }
+        return rc;
+#endif
+    }
 }
 
 int zcio_select_eintr(zcio_socket fd, bool want_read, bool want_write,

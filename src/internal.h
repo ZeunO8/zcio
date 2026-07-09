@@ -4,6 +4,7 @@
 #define ZCIO_INTERNAL_H
 
 #include "zcio/types.h"
+#include "zcio/stream.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -48,6 +49,16 @@ typedef int zcio_socket;
 void zcio_socket_startup(void);
 int  zcio_set_nonblocking(zcio_socket fd, bool on);
 
+/* --- poll ---------------------------------------------------------------- *
+ * Multi-fd readiness for the HTTP server event loop. POSIX poll(2) /
+ * WSAPoll(); struct pollfd + POLLIN/POLLOUT come from <poll.h> / <winsock2.h>.
+ * EINTR-safe (retries with the remaining timeout). Returns the poll() result:
+ * >0 ready count, 0 timeout, <0 error. */
+#if !defined(_WIN32)
+#  include <poll.h>
+#endif
+int zcio_poll_(struct pollfd *fds, size_t nfds, int timeout_ms);
+
 /* --- SIGPIPE suppression ------------------------------------------------ *
  * A send to a peer-closed socket must never raise SIGPIPE (which by default
  * kills the whole host process). Two complementary mechanisms:
@@ -75,5 +86,25 @@ int zcio_select_eintr(zcio_socket fd, bool want_read, bool want_write,
 static inline void *zcio_xmalloc(size_t n) { return malloc(n ? n : 1); }
 static inline void *zcio_xcalloc(size_t n, size_t sz) { return calloc(n ? n : 1, sz ? sz : 1); }
 char *zcio_strdup_(const char *s);  /* NULL-safe strdup using malloc */
+
+/* --- clock / entropy (util.c) -------------------------------------------- */
+uint64_t zcio_now_ms_(void);              /* monotonic milliseconds           */
+int      zcio_rand_bytes_(void *dst, size_t n); /* OS entropy; ZCIO_OK or ERR */
+
+/* --- raw-fd TCP stream (tcp.c) -------------------------------------------- *
+ * Wrap an already-connected, non-blocking socket in the standard "tcp" stream
+ * (stream owns and closes the fd). timeout_ms > 0: each read/write waits up to
+ * that long (select) before ZCIO_ERR_TIMEOUT. timeout_ms == 0: fully
+ * non-blocking - no wait, ZCIO_ERR_WOULDBLOCK when the socket isn't ready
+ * (this is what the HTTP server event loop uses). */
+zcio_stream *zcio_tcp_stream_from_fd_(zcio_socket fd, int timeout_ms);
+/* Adjust the timeout on a stream made by the tcp layer (any "tcp" stream).
+ * ZCIO_OK or ZCIO_ERR_INVALID_ARG when the stream isn't a tcp socket stream. */
+int zcio_tcp_stream_set_timeout_(zcio_stream *s, int timeout_ms);
+
+/* Set the transport timeout on a socket stream OR reach through a TLS overlay
+ * to its underlying socket stream (so a wss session honors its recv/send
+ * timeout). ZCIO_OK or ZCIO_ERR_INVALID_ARG. Implemented in tls.c. */
+int zcio_stream_set_timeout_(zcio_stream *s, int timeout_ms);
 
 #endif /* ZCIO_INTERNAL_H */

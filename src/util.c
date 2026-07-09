@@ -65,6 +65,48 @@ char *zcio_strdup_(const char *s) {
 
 void zcio_free(void *p) { free(p); }
 
+/* --- OS entropy ----------------------------------------------------------- *
+ * Used for WebSocket masking keys / handshake nonces (RFC 6455 requires a
+ * strong entropy source) without coupling the core to the TLS backend. */
+#if defined(_WIN32)
+#  include <bcrypt.h>
+#  pragma comment(lib, "bcrypt.lib")
+int zcio_rand_bytes_(void *dst, size_t n) {
+    if (!dst && n) return ZCIO_ERR_INVALID_ARG;
+    if (BCryptGenRandom(NULL, (PUCHAR)dst, (ULONG)n,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        return zcio_fail_(ZCIO_ERR, "BCryptGenRandom failed");
+    return ZCIO_OK;
+}
+#elif defined(__APPLE__) || defined(__ANDROID__) || \
+      defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+/* arc4random_buf (<stdlib.h>): kernel-seeded CSPRNG, cannot fail, no per-call
+ * size cap. It is the portable choice here: iOS SDKs ship no <sys/random.h>,
+ * and bionic declares getentropy only from API 28 while arc4random_buf is
+ * available from API 21. */
+int zcio_rand_bytes_(void *dst, size_t n) {
+    if (!dst && n) return ZCIO_ERR_INVALID_ARG;
+    arc4random_buf(dst, n);
+    return ZCIO_OK;
+}
+#else
+#  include <unistd.h>
+#  include <sys/random.h>   /* glibc 2.25+ / musl 1.1.20+ */
+int zcio_rand_bytes_(void *dst, size_t n) {
+    if (!dst && n) return ZCIO_ERR_INVALID_ARG;
+    uint8_t *p = (uint8_t *)dst;
+    while (n > 0) {
+        /* getentropy caps a single request at 256 bytes. */
+        size_t chunk = n > 256 ? 256 : n;
+        if (getentropy(p, chunk) != 0)
+            return zcio_fail_(ZCIO_ERR, "getentropy failed");
+        p += chunk;
+        n -= chunk;
+    }
+    return ZCIO_OK;
+}
+#endif
+
 /* --- library init ------------------------------------------------------- */
 extern void zcio_tls_install_default_backend(void); /* provided by tls backend TU */
 

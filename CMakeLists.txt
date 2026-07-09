@@ -101,6 +101,14 @@ set(ZCIO_SOURCES
     src/mcast.c
     src/tls.c
     src/http.c
+    src/http_util.c
+    src/http_server.c
+    src/h1.c
+    src/h2.c
+    src/hpack.c
+    src/h3.c
+    src/qpack.c
+    src/ws.c
     src/archive.c)
 
 # TLS backend selection: exactly one backend TU defines
@@ -191,7 +199,8 @@ foreach(lib IN LISTS ZCIO_LIBS)
         target_compile_definitions(${lib} PRIVATE ZCIO_WITH_ARCHIVE)
     endif()
     if(WIN32)
-        target_link_libraries(${lib} PUBLIC ws2_32)
+        # bcrypt: BCryptGenRandom behind zcio_rand_bytes_ (WebSocket entropy).
+        target_link_libraries(${lib} PUBLIC ws2_32 bcrypt)
     endif()
 endforeach()
 if(ZCIO_BUILD_SHARED)
