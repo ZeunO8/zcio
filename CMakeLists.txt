@@ -74,7 +74,7 @@ endif()
 # the cache) means every later "STREQUAL openssl" check picks the right path.
 if(ZCIO_TLS STREQUAL "openssl")
     find_package(OpenSSL)
-    if(OpenSSL_FOUND)
+    if(OPENSSL_FOUND)
         message(STATUS "zcio TLS backend: OpenSSL")
     else()
         message(WARNING "zcio: OpenSSL not found — building WITHOUT TLS support. "
