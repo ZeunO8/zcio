@@ -23,12 +23,16 @@ const zcio_tls_backend *zcio_tls_get_backend(void) {
 }
 
 bool zcio_tls_available(void) {
+    zcio_init(); /* self-init so the default backend is registered, same as
+                    the ctx creators below -- otherwise this reports false
+                    whenever it's the first zcio call a process makes. */
     /* A real backend is anything other than the "none" stub. */
     if (!g_backend || !g_backend->name) return false;
     return strcmp(g_backend->name, "none") != 0;
 }
 
 const char *zcio_tls_backend_name(void) {
+    zcio_init(); /* see zcio_tls_available() above */
     return (g_backend && g_backend->name) ? g_backend->name : "none";
 }
 
