@@ -40,7 +40,7 @@ with a C FFI bind it cleanly.
 | `zcio/ring.h`   | lock-free SPSC ring buffer (own or shared-memory) |
 | `zcio/membuf.h` | fixed memory view + byte-counting streams |
 | `zcio/net.h`    | TCP client/server, UDP client/server, UDP multicast |
-| `zcio/tls.h`    | pluggable TLS backend (OpenSSL default, or compiled out) + ALPN |
+| `zcio/tls.h`    | pluggable TLS backend (OpenSSL/mbedTLS, or compiled out) + ALPN |
 | `zcio/http.h`   | minimal synchronous HTTP/1.1 client |
 | `zcio/http_server.h` | hardened HTTP/1.1 · HTTP/2 · HTTP/3 server (version by config) + auto-HTTPS |
 | `zcio/ws.h`     | RFC 6455 WebSocket client + server (auto ws→wss upgrade) |
@@ -132,7 +132,7 @@ test compiles its native addon on demand via `node-gyp`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `ZCIO_TLS` | `openssl` (`none` on iOS/Android) | TLS backend: `openssl` or `none` |
+| `ZCIO_TLS` | `openssl` (`mbedtls` on iOS/Android) | TLS backend: `openssl`, `mbedtls` (FetchContent-built from source), or `none` |
 | `ZCIO_WITH_ARCHIVE` | `OFF` | libarchive support (FetchContent-clones a fork; opt in) |
 | `ZCIO_BUILD_TESTS` | `ON` (`OFF` when cross-compiling) | build the C test suite |
 | `ZCIO_BUILD_SHARED` | `OFF` | also build `libzcio` shared (needed for the Python/Node bindings) |
@@ -140,12 +140,15 @@ test compiles its native addon on demand via `node-gyp`.
 
 To build with no TLS dependency at all: `-DZCIO_TLS=none`.
 
-### iOS & Android (zero dependencies)
+### iOS & Android
 
 zcio builds for iOS and Android out of the box using only core OS system
-libraries (libc + BSD sockets) — no OpenSSL, no libarchive, nothing to vendor.
-On mobile targets the TLS backend defaults to `none` and the test suite
-defaults off (opt back in to run it on-target — see below).
+libraries (libc + BSD sockets) plus a from-source mbedTLS: on mobile targets
+the TLS backend defaults to `mbedtls` (pinned, FetchContent-built — neither OS
+ships OpenSSL as a public system library), so https/wss work on-device with
+the platform CA store. Pass `-DZCIO_TLS=none` for a fully dependency-free
+build. The test suite defaults off when cross-compiling (opt back in to run
+it on-target — see below).
 `CMakePresets.json` covers the common targets:
 
 ```sh
@@ -165,8 +168,8 @@ Cross-compiled binaries can't execute on the build host, so passing
 `-DZCIO_BUILD_TESTS=ON` on a cross build wires `CMAKE_CROSSCOMPILING_EMULATOR`
 to a launcher (`cmake/ZcioMobileTest.cmake`): `adb` push-and-run for Android
 (emulator or USB device), `xcrun simctl spawn` into the simulator for iOS. A
-plain `ctest` then behaves exactly like a host run — TLS/archive tests
-self-skip on the dependency-free mobile builds.
+plain `ctest` then behaves exactly like a host run — archive tests (and TLS
+tests, on a `-DZCIO_TLS=none` build) self-skip when the dependency is out.
 
 No device needs to be running: if nothing is online the launcher boots the
 best available emulator/simulator itself (Android: `ZCIO_ANDROID_AVD` or the

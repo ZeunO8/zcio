@@ -10,10 +10,11 @@ project(zcio
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-# Mobile targets (the iOS family and Android) build dependency-free by
-# default: neither OS ships OpenSSL as a public system library, so TLS
-# defaults to the "none" backend there and archive support stays opt-in.
-# Everything else zcio uses is core OS on both (libc, BSD sockets).
+# Mobile targets (the iOS family and Android): neither OS ships OpenSSL as a
+# public system library, so TLS defaults to the mbedTLS backend there —
+# pure C, Apache-2.0, FetchContent-built from source, cross-compiles cleanly
+# under the NDK/iOS toolchains. Desktop/server keeps OpenSSL (system-provided,
+# h3/QUIC-capable). "none" remains available for dependency-free builds.
 if(CMAKE_SYSTEM_NAME MATCHES "^(iOS|tvOS|watchOS|visionOS)$" OR ANDROID)
     set(ZCIO_MOBILE ON)
 else()
@@ -21,12 +22,12 @@ else()
 endif()
 
 if(ZCIO_MOBILE)
-    set(ZCIO_TLS_DEFAULT "none")
+    set(ZCIO_TLS_DEFAULT "mbedtls")
 else()
     set(ZCIO_TLS_DEFAULT "openssl")
 endif()
-set(ZCIO_TLS "${ZCIO_TLS_DEFAULT}" CACHE STRING "TLS backend: openssl | none")
-set_property(CACHE ZCIO_TLS PROPERTY STRINGS openssl none)
+set(ZCIO_TLS "${ZCIO_TLS_DEFAULT}" CACHE STRING "TLS backend: openssl | mbedtls | none")
+set_property(CACHE ZCIO_TLS PROPERTY STRINGS openssl mbedtls none)
 # Off by default: the archive backend FetchContent-clones a non-canonical
 # libarchive fork. Opt in explicitly with -DZCIO_WITH_ARCHIVE=ON.
 option(ZCIO_WITH_ARCHIVE "Build libarchive-backed archive support" OFF)
@@ -81,6 +82,21 @@ if(ZCIO_TLS STREQUAL "openssl")
                         "and reconfigure to enable it.")
         set(ZCIO_TLS "none")
     endif()
+elseif(ZCIO_TLS STREQUAL "mbedtls")
+    # Built from source (FetchContent): no system TLS exists on mobile, and a
+    # pinned in-tree build keeps the mobile story hermetic everywhere else too.
+    include(FetchContent)
+    set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+    set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+    # mbedTLS defaults -Werror on; new toolchains must not brick the build.
+    set(MBEDTLS_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+    message(STATUS "zcio: FetchContent mbedTLS v3.6.7")
+    FetchContent_Declare(mbedtls
+        GIT_REPOSITORY https://github.com/Mbed-TLS/mbedtls.git
+        GIT_TAG v3.6.7
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(mbedtls)
+    message(STATUS "zcio TLS backend: mbedTLS")
 else()
     message(STATUS "zcio TLS backend: none (TLS compiled out)")
 endif()
@@ -130,6 +146,8 @@ set_source_files_properties(
 # zcio_tls_install_default_backend().
 if(ZCIO_TLS STREQUAL "openssl")
     list(APPEND ZCIO_SOURCES src/tls_openssl.c)
+elseif(ZCIO_TLS STREQUAL "mbedtls")
+    list(APPEND ZCIO_SOURCES src/tls_mbedtls.c)
 else()
     list(APPEND ZCIO_SOURCES src/tls_none.c)
 endif()
@@ -207,6 +225,15 @@ foreach(lib IN LISTS ZCIO_LIBS)
         if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
             target_compile_options(${lib} PRIVATE -Wno-deprecated-declarations)
         endif()
+    elseif(ZCIO_TLS STREQUAL "mbedtls")
+        # BUILD_INTERFACE only: the mbedTLS targets are FetchContent-built and
+        # not part of the zcioTargets export set — an installed zcio with the
+        # mbedtls backend would need its own mbedTLS. FetchContent consumption
+        # (the primary path for this backend: Android/iOS embedders) links the
+        # in-tree targets directly.
+        target_link_libraries(${lib} PUBLIC
+            $<BUILD_INTERFACE:mbedtls> $<BUILD_INTERFACE:mbedx509> $<BUILD_INTERFACE:mbedcrypto>)
+        target_compile_definitions(${lib} PRIVATE ZCIO_TLS_MBEDTLS)
     endif()
     if(ZCIO_WITH_ARCHIVE)
         target_include_directories(${lib} PRIVATE ${libarchive_SOURCE_DIR}/libarchive)
@@ -229,6 +256,8 @@ include(GNUInstallDirs)
 if(ZCIO_TLS STREQUAL "openssl")
     set(ZCIO_PC_REQUIRES_PRIVATE "openssl")
 else()
+    # mbedtls: FetchContent-built and statically absorbed — no pc dependency
+    # to declare (see the BUILD_INTERFACE note at the link step).
     set(ZCIO_PC_REQUIRES_PRIVATE "")
 endif()
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/zcio.pc.in
