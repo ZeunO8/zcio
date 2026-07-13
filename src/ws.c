@@ -817,9 +817,15 @@ zcio_ws_connect(const char *url, const zcio_http_header *headers, size_t nheader
             client = zcio_tcp_client_connect(host, port);
         }
         if (!client) {
+            /* zcio_tcp_client_connect[_tls] already called zcio_fail_ with a
+             * specific reason (DNS failure, timed out, connect refused, ...)
+             * -- preserve it instead of clobbering with a bare "connect
+             * failed" that hides which of those it actually was. */
+            char underlying[192];
+            snprintf(underlying, sizeof underlying, "%s", zcio_last_error());
             if (tls) zcio_tls_ctx_free(tls);
             free(host); free(path); free(cur);
-            zcio_fail_(ZCIO_ERR_CONNECT, "ws: connect failed");
+            zcio_fail_(ZCIO_ERR_CONNECT, "ws: connect failed: %s", underlying);
             return NULL;
         }
         zcio_stream *s = zcio_tcp_client_stream(client);
