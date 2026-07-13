@@ -204,72 +204,92 @@ int zcio_tcp_stream_set_timeout_(zcio_stream *s, int timeout_ms) {
 #define TCP_DEFAULT_CONNECT_TIMEOUT_MS 15000
 
 /* Returns a connected fd or ZCIO_INVALID_SOCKET (error message left).
- * connect_timeout_ms <= 0 selects the default. */
+ * connect_timeout_ms <= 0 selects the default.
+ *
+ * Dual-stack: resolves BOTH A and AAAA records (getaddrinfo AF_UNSPEC) and
+ * tries each candidate in the order the resolver returned (glibc/BSD/Apple
+ * resolvers already apply RFC 6724 destination-address ordering, so this is
+ * a reasonable happy-eyeballs approximation without full RFC 8305
+ * parallelism). Previously this resolved A-only (zcio_resolve_ipv4) and
+ * connected via a single AF_INET socket, which fails outright with zero
+ * fallback on an IPv6-only network: there's no A record to find (NAT64/
+ * DNS64 synthesizes AAAA from A for IPv6-only clients, not the reverse), so
+ * the connect never even reaches the socket layer. IPv6-only is the default
+ * on several major cellular carriers today and is an explicit Apple App
+ * Store review requirement for exactly this reason -- confirmed live: a
+ * QUANTIX iOS client on cellular couldn't reach ANY exchange host at all,
+ * while the same build worked fine in Simulator (dual-stack Mac Wi-Fi). */
 static zcio_socket tcp_do_connect(const char *host, int port, int connect_timeout_ms) {
-    char *ip = zcio_resolve_ipv4(host);
-    if (!ip) return ZCIO_INVALID_SOCKET; /* zcio_resolve_ipv4 set the error */
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    char port_str[16];
+    snprintf(port_str, sizeof port_str, "%d", port);
+
+    struct addrinfo *result = NULL;
+    int gai_rc = getaddrinfo(host, port_str, &hints, &result);
+    if (gai_rc != 0 || !result) {
+        zcio_fail_(ZCIO_ERR_DNS, "tcp: getaddrinfo(%s) failed: %s", host, gai_strerror(gai_rc));
+        return ZCIO_INVALID_SOCKET;
+    }
 
     zcio_socket_startup();
-    zcio_socket fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == ZCIO_INVALID_SOCKET) {
-        free(ip);
-        zcio_fail_(ZCIO_ERR_CONNECT, "tcp: socket() failed");
-        return ZCIO_INVALID_SOCKET;
-    }
-    zcio_socket_nosigpipe(fd);
+    int cto = connect_timeout_ms > 0 ? connect_timeout_ms
+                                     : TCP_DEFAULT_CONNECT_TIMEOUT_MS;
 
-    /* Non-blocking BEFORE connect so the EINPROGRESS + 15s-select path below is
-     * live (a blocking socket would silently use the kernel default timeout).
-     * The socket is left non-blocking; per-op tcp_wait() governs read/write
-     * timeouts, consistent with tcp_s_read/tcp_s_write EWOULDBLOCK handling. */
-    zcio_set_nonblocking(fd, true);
+    zcio_socket fd = ZCIO_INVALID_SOCKET;
+    const char *last_err = "no address candidates";
+    bool last_err_timeout = false;
+    for (struct addrinfo *p = result; p; p = p->ai_next) {
+        zcio_socket cand = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (cand == ZCIO_INVALID_SOCKET) { last_err = "socket() failed"; continue; }
+        zcio_socket_nosigpipe(cand);
+        /* Non-blocking BEFORE connect so the EINPROGRESS + select path below
+         * is live (a blocking socket would silently use the kernel default
+         * timeout). Left non-blocking; per-op tcp_wait() governs read/write
+         * timeouts, consistent with tcp_s_read/tcp_s_write EWOULDBLOCK
+         * handling. */
+        zcio_set_nonblocking(cand, true);
 
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof addr);
-    addr.sin_family = AF_INET;
-    addr.sin_port   = htons((unsigned short)port);
-    if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
-        zcio_closesocket(fd);
-        zcio_fail_(ZCIO_ERR_CONNECT, "tcp: invalid address %s", ip);
-        free(ip);
-        return ZCIO_INVALID_SOCKET;
-    }
-    free(ip);
+        if (connect(cand, p->ai_addr, (socklen_t)p->ai_addrlen) == 0) { fd = cand; break; }
 
-    if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0)
-        return fd;
-
-    /* In-progress (non-blocking sockets); wait up to the connect timeout. The
-     * original blocks via the default socket but tolerates EINPROGRESS, so we
-     * mirror it. */
 #if defined(_WIN32)
-    int err = WSAGetLastError();
-    bool inprog = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
+        int err = WSAGetLastError();
+        bool inprog = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
 #else
-    bool inprog = (errno == EINPROGRESS);
+        bool inprog = (errno == EINPROGRESS);
 #endif
-    if (inprog) {
-        int cto = connect_timeout_ms > 0 ? connect_timeout_ms
-                                         : TCP_DEFAULT_CONNECT_TIMEOUT_MS;
-        sock_wait w = tcp_wait(fd, cto, false, true);
+        if (!inprog) {
+            zcio_closesocket(cand);
+            last_err = "connect failed immediately";
+            last_err_timeout = false;
+            continue;
+        }
+
+        sock_wait w = tcp_wait(cand, cto, false, true);
         if (w.rc > 0 && w.writable) {
             int so_error = 0;
             socklen_t len = sizeof so_error;
-            getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len);
-            if (so_error == 0) return fd;
-            zcio_closesocket(fd);
-            zcio_fail_(ZCIO_ERR_CONNECT, "tcp: connect to %s:%d failed", host, port);
-            return ZCIO_INVALID_SOCKET;
+            getsockopt(cand, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len);
+            if (so_error == 0) { fd = cand; break; }
+            zcio_closesocket(cand);
+            last_err = "connect failed";
+            last_err_timeout = false;
+            continue;
         }
-        zcio_closesocket(fd);
-        zcio_fail_(w.rc == 0 ? ZCIO_ERR_TIMEOUT : ZCIO_ERR_CONNECT,
-                   "tcp: connect to %s:%d %s", host, port,
-                   w.rc == 0 ? "timed out" : "select failed");
-        return ZCIO_INVALID_SOCKET;
+        zcio_closesocket(cand);
+        last_err = w.rc == 0 ? "timed out" : "select failed";
+        last_err_timeout = (w.rc == 0);
     }
-    zcio_closesocket(fd);
-    zcio_fail_(ZCIO_ERR_CONNECT, "tcp: connect to %s:%d failed immediately", host, port);
-    return ZCIO_INVALID_SOCKET;
+    freeaddrinfo(result);
+
+    if (fd == ZCIO_INVALID_SOCKET) {
+        zcio_fail_(last_err_timeout ? ZCIO_ERR_TIMEOUT : ZCIO_ERR_CONNECT,
+                   "tcp: connect to %s:%d failed (%s)", host, port, last_err);
+    }
+    return fd;
 }
 
 /* ------------------------------ TCP client ------------------------------ */
