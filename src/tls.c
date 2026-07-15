@@ -106,13 +106,20 @@ const char *zcio_tls_stream_alpn(zcio_stream *tls) {
 
 /* Set a transport timeout on either a bare socket stream or a TLS overlay
  * (reaching through to its underlying socket stream). Lives here so it can
- * consult the TLS backend without the tcp layer knowing about TLS. */
+ * consult the TLS backend without the tcp layer knowing about TLS.
+ *
+ * Probe for the TLS overlay FIRST: stream_transport() answers NULL for
+ * non-TLS streams without touching the error slot, whereas the old order
+ * (try the raw-tcp setter, fall through on failure) called zcio_fail_ on
+ * every TLS stream before succeeding via the reach-through — poisoning
+ * zcio_last_error() with a stale "set_timeout: not a tcp stream" on every
+ * wss:// send/recv (ws.c's ws_apply_timeout), which callers then read back
+ * as the "reason" for whatever genuinely failed later (e.g. a clean peer
+ * EOF surfacing as "set_timeout: not a tcp stream"). */
 int zcio_stream_set_timeout_(zcio_stream *s, int timeout_ms) {
-    if (zcio_tcp_stream_set_timeout_(s, timeout_ms) == ZCIO_OK)
-        return ZCIO_OK;
     if (g_backend && g_backend->stream_transport) {
         zcio_stream *t = g_backend->stream_transport(s);
         if (t) return zcio_tcp_stream_set_timeout_(t, timeout_ms);
     }
-    return zcio_fail_(ZCIO_ERR_INVALID_ARG, "set_timeout: unsupported stream");
+    return zcio_tcp_stream_set_timeout_(s, timeout_ms);
 }
