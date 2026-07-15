@@ -321,8 +321,15 @@ tcp_client_make(const char *host, int port, zcio_tls_ctx *ctx, bool verify,
     if (ctx) {
         zcio_stream *wrapped = zcio_tls_wrap(ctx, plain, false, verify);
         if (!wrapped) {
+            /* zcio_tls_wrap already called zcio_fail_ with the specific
+             * reason (cert verification failure detail, handshake alert,
+             * ...) -- preserve it instead of clobbering with a bare "TLS
+             * handshake failed" that hides which of those it actually was.
+             * (Same bug class as ws.c's zcio_ws_connect() -- see that fix.) */
+            char underlying[192];
+            snprintf(underlying, sizeof underlying, "%s", zcio_last_error());
             zcio_stream_free(plain); /* destroys ctx -> closes fd */
-            zcio_fail_(ZCIO_ERR_TLS, "tcp_client: TLS handshake to %s failed", host);
+            zcio_fail_(ZCIO_ERR_TLS, "tcp_client: TLS handshake to %s failed: %s", host, underlying);
             return NULL;
         }
         use = wrapped;
